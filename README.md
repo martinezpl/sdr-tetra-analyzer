@@ -26,6 +26,7 @@
   - [Layout](#layout)
   - [Tests](#tests)
 - [To be optimized](#to-be-optimized)
+- [Known issues](#known-issues)
 
 ## Prerequisites
 
@@ -35,7 +36,18 @@ It opens the receiver through SoapySDR. `sweep` and `run` call
 `enumerate()`: a stick is visible only after that stick's Soapy plugin is on
 disk. `./build.sh` detects the OS, lists the hardware modules the package
 manager ships, and installs them. A factory the OS does not package is not
-built here. USRP stays `no SDR found` until the host has `soapysdr-module-uhd`.
+built here. When USB shows a known stick that Soapy does not list, the
+program names the stick and says what to install or check.
+
+These receivers were tested on the Raspberry Pi 5 in September 2026:
+
+| Receiver | Result | Notes |
+| --- | --- | --- |
+| RTL-SDR Blog V4 | works, the reference | 3.2 MS/s, 17 spans for the whole band |
+| LimeSDR-USB, USB 3 | works | 61.44 MS/s, one span for the whole band. See the LimeSDR notes below |
+| USRP B210, USB 3 | works, but a wide span is not real time | Needs the UHD images and `--device-args num_recv_frames=1024`. At 61.44 MS/s with 46 slots, `run` kept up with 76% of the signal |
+| ADALM-Pluto, USB 2 | works, with a known crash | The link carries about 7 MS/s, so the sweep takes 6 MS/s. See [Known issues](#known-issues) |
+| bladeRF x115, USB 3 | does not stream | SoapyBladeRF 0.4.2 overflows. See the bladeRF notes below |
 
 For a receiver with no module, the IQ feed can be piped in instead:
 
@@ -58,23 +70,28 @@ install yourself.
 | Platform | State |
 | --- | --- |
 | Debian 13 (trixie) aarch64, Raspberry Pi 5 | verified, the reference target |
-| macOS arm64 (Darwin 25) | verified |
+| macOS arm64 (Darwin 25) | verified before FFTW and the filter bank came in; not tested since |
 | Other Linux, x86-64 or ARM | expected to work, not tested |
 | FreeBSD and the other BSDs | expected to work, not tested |
 | Windows | not supported |
 
 ### Headroom 
 A Raspberry Pi 5 runs 15 carriers at 3.2 MS/s in about one of
-its four cores, at 92 MB for the whole tree.
+its four cores, at 92 MB for the whole tree. With a LimeSDR-USB at 61.44 MS/s
+and 30 carriers, the tree took about 2.9 of the four cores, 2.2 of them in
+the parent, and `clock.log` stayed clean.
 
 ### Packages
 
 `./build.sh` installs the compiler tools, cmake, volk, SoapySDR, FFTW, and every
 hardware Soapy module this OS lists (`soapysdr-module-*` on apt, `soapy*`
 plus `limesuite` on Homebrew). It skips the kitchen-sink `-all` package and
-the remote/audio/osmosdr wrappers, which conflict or are not a stick.
+the remote/audio/osmosdr wrappers, which conflict or are not a stick. On
+Debian it installs the host packages without Recommends, because
+`libsoapysdr0.8` recommends that `-all` package. It adds `ca-certificates`
+for HTTPS and `soapysdr-tools` for `SoapySDRUtil`.
 
-`SKIP_DEPS=1 ./build.sh` leaves cmake/volk/SoapySDR as they are.
+`SKIP_DEPS=1 ./build.sh` leaves the host packages as they are.
 `SOAPY_SKIP_MODULES=1 ./build.sh` leaves the device plugins as they are.
 
 What the two reference hosts typically ship:
@@ -123,7 +140,7 @@ automatic gain, so "auto" keeps the gain of the driver, 32 dB.
 
 ### Active TETRA network in range
 `sweep` runs a scan for active control carriers across the TETRA spectrum, and the traffic carriers are then learned from the grants that the
-control carriers broadcast. See "Find your carriers" below.
+control carriers broadcast. See [Finding carriers](#finding-carriers) below.
 
 ## Installation
 
@@ -158,9 +175,11 @@ ships, checks out the submodules, fetches the speech codec, and builds
 ```
 
 `run` exposes every setting as a flag. Ctrl-C, SIGTERM, or the end of the
-input stops a run and closes the files cleanly. Logs go to stdout. A live
-run prints `radio rtlsdr 0`, or the Soapy driver key of the device that
-opened.
+input stops a run and closes the files cleanly. A receiver that gives no
+samples for 5 s stops `sweep` and `run` with `the receiver stopped`, so an
+unplugged stick ends the run and does not hang it. Logs go to stdout. A live
+run prints `radio rtlsdr 0`, where `rtlsdr` is the driver name in Soapy's
+device list (`lime`, `uhd`, `plutosdr`, ...).
 
 ```
 nohup ./tetra-analyze run --carriers 419162500,419562500 \
@@ -170,66 +189,81 @@ nohup ./tetra-analyze run --carriers 419162500,419562500 \
 ### Finding carriers
 
 `sweep` measures every channel of the raster, then puts a demodulator on
-each peak. It prints a ready `run` command line:
+each peak. It prints a ready `run` command line. The messages of the Soapy
+driver are left out here:
 
 ```
 $ ./tetra-analyze sweep
 Found Rafael Micro R828D tuner
 RTL-SDR Blog V4 Detected
 tetra-analyze: the receiver takes 3.200 MS/s, so a span is 3.170 MHz
-tetra-analyze: sweep 380.000-430.000 MHz, 12.5 kHz raster, 3.2 MS/s, 17 span(s)
+tetra-analyze: sweep 380.000-430.000 MHz, 12.5 kHz raster, 3.2 MS/s, 17 span(s), rx 0 RX
 tetra-analyze: span 1 at 381.585 MHz, 254 channels
 tetra-analyze: span 2 at 384.596 MHz, 241 channels
 [...]
-tetra-analyze: 41 peak(s) at or above 6.0 dB over the noise floor
-tetra-analyze: 7 span(s) to decode
-tetra-analyze: span 1 of 7, decode 2 candidate(s) at 385.280 MHz for 8 s
+tetra-analyze: 106 peak(s) at or above 6.0 dB over the noise floor
+tetra-analyze: 14 span(s) to decode
+tetra-analyze: calibrate on 14 candidate(s) at 420.680 MHz for 3 s
+tetra-analyze: the receiver is off by about +0.08 ppm, and each dwell corrects that
+tetra-analyze: span 1 of 14, decode 4 candidate(s) at 382.230 MHz for 15 s
 [...]
-tetra-analyze: span 7 of 7, decode 3 candidate(s) at 427.240 MHz for 8 s
+tetra-analyze: span 14 of 14, decode 7 candidate(s) at 429.040 MHz for 15 s
 
   channel       SNR dB  role                     cell main carrier  error Hz
-  385002500        7.0  no lock, not TETRA          -                  -
-  385300000        21.8  TETRA traffic carrier    385300000          -143
-  389750000        22.0  TETRA control carrier    389750000          -217
+  390012500        8.1  TETRA traffic carrier    391037500          -497
+  390512500       23.9  TETRA control carrier    390512500          -292
+  390862500       23.1  TETRA traffic carrier    390512500          -257
   [...]
-  
 
-20 TETRA carrier(s), of which 7 are a control carrier.
+24 TETRA carrier(s), of which 8 are a control carrier.
 
-The receiver is off by about -0.43 ppm, from 9 carrier(s) above the noise that
-held lock, spread -1.03 to +0.20 ppm. Each run below carries the
+The receiver is off by about -0.75 ppm, from 13 carrier(s) above the noise that
+held lock, spread -3.95 to +0.96 ppm. Each run below carries the
 offset in Hz at its own centre, because the error scales with it.
 That spread is wide for one oscillator. A carrier of its own may
 sit off frequency, or a weak one may not have settled. A longer
 --dwell tightens it.
 
-Those carriers do not fit one span at 3.2 MS/s, so they need 2 runs,
+Those carriers do not fit one span at 3.2 MS/s, so they need 3 runs,
 one for each span. A receiver hears one span at a time, so running them
 at once needs one receiver for each, named with --device.
 
-  # span 1 of 2, 9 carrier(s), 4 control
+  # span 1 of 3, 6 carrier(s), 3 control, 3 listed
 
-  ./tetra-analyze run --center [...] \
-      --tune-offset -166 \
+  ./tetra-analyze run --center 390890000 \
       --rate 3200000 \
-      --carriers [...]
+      --tune-offset -292 \
+      --carriers 390512500,391037500,391562500
 
-  # span 2 of 2, 9 carrier(s), 3 control
+  # span 2 of 3, 9 carrier(s), 3 control, 3 listed
+[...]
 
-  ./tetra-analyze run --center [...] \
-      --tune-offset -180 \
-      --rate 3200000 \
-      --carriers [...]
-
-2 carrier(s) sit too far from any control carrier to share a span with
-one, so nothing would grant them: [...]
+3 carrier(s) sit too far from any control carrier to share a span with
+one, so nothing would grant them: 393237500 393287500 419550000
 They are traffic carriers of a cell whose control carrier the sweep did
 not find. Widen --band or raise --dwell to look for it.
 
-A power scan sees a carrier only while it transmits, so an idle traffic
-carrier is missing from that list. "run" reports each grant that names a
-carrier the list does not hold, so watch its log and add what it names.
+Each run line lists the control carriers, and any carrier whose cell the
+sweep could not read. "run" gives a free slot to each traffic carrier when
+a control carrier first grants a call on it, and it keeps what it learns for
+the next start. An idle traffic carrier sends nothing, so the sweep does not
+count it. If "run" logs NOSLOT, raise --max-carriers.
 ```
+
+With no `--rate`, the sweep asks for the widest rate that holds the whole
+band (or a narrower `--band`) in one span, up to what the receiver takes.
+Then it measures the samples that arrive for one second, and it steps down
+to a rate that the link carries if samples are missing. A Pluto on USB 2.0
+lists 10 MS/s but delivers about 7, so the sweep takes 6 MS/s. The rate that
+the sweep uses goes into the run lines.
+
+Before the dwells, a short calibration dwell of 3 s on the candidates of one
+span measures the frequency error of the receiver. Every dwell then moves
+its filters by that error. A receiver far off frequency (a Pluto was 10 ppm
+off, which is 4 kHz at 420 MHz) would otherwise cut the edge of each carrier,
+and its system information would fail. A span with more candidates than
+`--max-carriers` gets more than one dwell, strongest first
+(`part 2 of 3`), so no peak goes undecoded.
 
 With `--carriers` and no `--center`, the receiver tunes to the midpoint of
 your list.
@@ -241,6 +275,13 @@ your list.
   the moment a grant names it, so the list fills itself. Naming a traffic
   carrier you already know is a convenience: a slot is on it before its first
   call starts, so the head of that call is not lost to the time a retune takes.
+
+The run lines that `sweep` prints list only the control carriers, and any
+carrier whose cell it could not read. The traffic carriers that it found still
+set the centre of each span, so their grants land inside it, and a span with
+more carriers than the pool default (15) gets `--max-carriers` for all of
+them. So only the first call on each traffic carrier loses its head, because
+`run` keeps the carriers it learns in `DIR/carriers`.
 
 `sweep` tells the two apart: a carrier whose system information names itself
 as the main carrier of its cell is a control carrier.
@@ -276,6 +317,9 @@ all over again. `--no-learn` turns that file off.
 | `--max-carriers N` | 15 | Size of the carrier pool. Spare slots learn carriers from grants |
 | `--per-carrier` | off | Also write one WAV and one log for each carrier. Costs much more CPU, and it fixes the carrier list |
 | `--iq FILE` | — | Replay a capture instead of opening the dongle |
+| `--rx CHANNEL` | 0 | RX channel of the receiver |
+| `--antenna NAME` | driver default, LNAW for a Lime | RX input of the receiver (LNAL, LNAH, LNAW, ...) |
+| `--device-args ARGS` | none | Soapy device arguments, `KEY=VALUE,...`, for example `num_recv_frames=1024` for a USRP |
 
 ### Output
 
@@ -288,9 +332,11 @@ Each run makes one directory, `recordings/<start_utc>/`:
 | `timemap.log` | Anchors that tie a position in a WAV to a capture sample |
 | `clock.log` | UTC against the sample counter, one line each second |
 
-`clock.log` is the health record of a run. Its `queue` and `dropped` columns
-must stay at zero; anything else means the host cannot keep up with the
-dongle.
+`clock.log` is the health record of a run. Its `dropped` column counts the
+overflows that the driver of the receiver reported. It must stay at zero;
+anything else means the host cannot keep up with the receiver. The `queue`
+column is always 0: it belonged to a reader thread that the program no
+longer has, and `--queue-blocks` is still accepted but does nothing.
 
 Because silence is removed, a position in a WAV is not a wall-clock time on
 its own. `src/timemap.py` converts between the two with the anchors of
@@ -348,14 +394,17 @@ dongle ────── IQ──▶ PARENT
 ```
 
 ### Parent — the radio consumer
-It owns the receiver. A reader thread takes blocks from it into a bounded queue; 
-an overflow drops the newest block and counts it in `clock.log`. The main loop converts each block
-to complex float and runs one channelizer for each carrier. A channelizer
+It owns the receiver, and it reads it on the thread that opened it, because
+SoapyRTLSDR crashed when another thread read it. An overflow that the driver
+reports counts in the `dropped` column of `clock.log`. The main loop takes
+each block as complex float (a raw `--iq` input is converted first) and runs
+one channelizer for each carrier. A channelizer
 shifts its carrier down to baseband and lowers the sample rate, so a child
 works on one narrow stream instead of the whole span. A span wider than
-4 MS/s first goes through a polyphase filter bank (`src/pfb.cpp`). The bank
-splits the span into sub-bands at most 0.5 MHz apart, on up to four
-threads, and each channelizer then works on the sub-band of its carrier.
+4 MS/s, whose rate divides into whole sub-band rates, first goes through a
+polyphase filter bank (`src/pfb.cpp`). The bank splits the span into
+sub-bands at most 0.5 MHz apart, on up to four threads, and each
+channelizer then works on the sub-band of its carrier, on the same threads.
 Without the bank, each channelizer filters the full rate, and a full
 61.44 MS/s span with 15 carriers would need about 4.6 cores. The result goes down
 that carrier's pipe. The parent also writes `clock.log`
@@ -390,8 +439,11 @@ is never taken back, so each carrier costs one lock time ever — about 0.2 to
 
 The span is the hard limit. A grant for a carrier the receiver cannot reach
 is recorded in `calls.log` as `OUTSIDE` and never enters the pool. A grant
-naming a frequency far outside the span is a decode error rather than a
-carrier, so it is recorded as `BADFREQ` and kept out on the same test.
+naming a frequency 10 MHz or more from the carrier that sent it is a decode
+error rather than a carrier, because a network keeps its carriers within a
+few MHz of each other. It is recorded as `BADFREQ` and kept out too. The
+test uses the sending carrier and not the centre of the span, because the
+centre of a wide span can sit between two networks.
 
 ### The shared allocation table
 A control carrier announces that a talkgroup has been granted a traffic
@@ -434,8 +486,8 @@ the worst outcome for something left running unattended.
 
 ### Layout
 
-- `src/` — the program: the parent, the carrier children, the stitch
-  process, the wall-clock map and the tests.
+- `src/` — the program: the parent, the filter bank, the carrier children,
+  the sweep, the stitch process, the wall-clock map and the tests.
 - `sdrpp-tetra-demodulator/` — a submodule that gives the TETRA channel
   decoder and the DSP blocks. It's my fork of
   [cropinghigh/sdrpp-tetra-demodulator](https://github.com/cropinghigh/sdrpp-tetra-demodulator).
@@ -462,6 +514,16 @@ on a Pi 5, 24 carriers at 61.44 MS/s take 2.9 s for 3.9 s of signal. The
 channelizers of a narrow span could use the same threads.
 `volk-config-info --machine` gives `neonv8_orc` on a Pi 5, so the NEON
 kernels already carry the present load.
+
+**The parent reads the radio between blocks, on one thread.** It reads a
+block, then runs the bank and the channelizers, then reads the next one. A
+driver with a large buffer of its own (LimeSuite) does not notice. UHD has
+a small buffer and needs a reader that never stops: a USRP B210 at 61.44
+MS/s with 46 slots kept up with only 76% of the signal, even with
+`num_recv_frames=1024`. A reader thread would overlap the two. The program
+had one and dropped it because SoapyRTLSDR crashed when a thread other than
+the opener read it, so a new one must open, read and close on its own
+thread.
 
 **FFTW plans the filter bank for about 3.7 s at the start.** `FFTW_MEASURE`
 tries many ways to do the FFT and keeps the fastest, which is 37% faster
@@ -508,3 +570,13 @@ GNU-only `md5sum` and `stat -c%s`, and on a host with no `md5sum` its
 integrity test silently reports success and skips the retry over HTTP. It
 belongs to the submodule, not here, so `build.sh` checks for a patched file
 afterwards instead of trusting the exit status.
+
+## Known issues
+
+**An ADALM-Pluto sweep crashed twice with heap corruption.** Two of about
+nine sweeps with a Pluto ended with `corrupted size vs. prev_size` when the
+sweep freed its buffers. AddressSanitizer and gdb did not find the cause, and
+the other receivers never showed it.
+
+**A bladeRF x115 does not stream through SoapyBladeRF 0.4.2.** See the
+bladeRF notes under [Packages](#packages).
