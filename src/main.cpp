@@ -2,18 +2,14 @@
 #include <cctype>
 #include <cerrno>
 #include <cmath>
-#include <condition_variable>
 #include <csignal>
 #include <cstring>
 #include <ctime>
 #include <cstdlib>
-#include <deque>
 #include <iostream>
 #include <iterator>
 #include <set>
-#include <mutex>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include <dirent.h>
@@ -28,7 +24,8 @@
 #include <dsp/channel/rx_vfo.h>
 #include "allocations.h"
 #include "demod_chain.h"
-#include "rtl.h"
+#include "pfb.h"
+#include "radio.h"
 #include "sweep.h"
 
 int child_main(int fd, uint32_t hz, const std::string& dir, const std::string& start_utc, double iq_rate,
@@ -42,29 +39,25 @@ static const double DEFAULT_TUNE_OFFSET = 0;
 static const double DEFAULT_RATE = 3200000;
 static const char* DEFAULT_OUT = "recordings";
 static const size_t DEFAULT_MAX_GSSI = 256;
-// The pool of carrier slots. The measured cost is about 1.6% of one core in
-// the channelizer of the parent for each one, plus about 1.5% in its child.
-static const size_t DEFAULT_MAX_CARRIERS = 15;
 // One health line every five minutes. A month of running is then 8640 lines.
 static const double DEFAULT_STATUS = 300;
-// The dongle callback makes about 400 blocks each second at every rate that main() sets.
 static const size_t DEFAULT_QUEUE_BLOCKS = 400;
 
 static const char* USAGE =
-	"tetra-sniff - an unattended recorder for clear TETRA speech.\n"
+	"tetra-analyze - an unattended recorder for clear TETRA speech.\n"
 	"\n"
 	"usage:\n"
-	"  tetra-sniff run --carriers HZ,HZ,... [options]\n"
-	"  tetra-sniff run [options] DL_HZ DL_HZ ...\n"
-	"  tetra-sniff sweep [options]\n"
-	"  tetra-sniff help\n"
+	"  tetra-analyze run --carriers HZ,HZ,... [options]\n"
+	"  tetra-analyze run [options] DL_HZ DL_HZ ...\n"
+	"  tetra-analyze sweep [options]\n"
+	"  tetra-analyze help\n"
 	"\n"
-	"\"run\" opens the RTL-SDR dongle, follows every carrier in the carrier list and\n"
+	"\"run\" opens the receiver, follows every carrier in the carrier list and\n"
 	"writes each clear call to its own WAV file. Ctrl-C, SIGTERM or the end of the\n"
 	"input stops the run. Every log line goes to stdout, one line at a time, so a\n"
 	"redirect works in the background:\n"
 	"\n"
-	"  ./tetra-sniff run > tetra-sniff.log 2>&1 &\n"
+	"  ./tetra-analyze run > tetra-analyze.log 2>&1 &\n"
 	"\n"
 	"Each run makes one directory, DIR/<start_utc>/, which holds:\n"
 	"  calls/<GSSI>.wav   the speech of one talkgroup, 8 kHz mono s16, no silence\n"
@@ -76,7 +69,7 @@ static const char* USAGE =
 	"                       OUTSIDE  the carrier lies outside the captured span,\n"
 	"                                so no slot can reach it. Move --center. The\n"
 	"                                default rate is already the highest the\n"
-	"                                dongle takes, so the span cannot widen\n"
+	"                                receiver takes, so the span cannot widen\n"
 	"                       BADFREQ  the grant named a frequency megahertz away\n"
 	"                                from the span, so that grant decoded wrong.\n"
 	"                                Nothing can be done about it\n"
@@ -84,7 +77,7 @@ static const char* USAGE =
 	"  clock.log          UTC against the sample counter, one line each second\n"
 	"\n"
 	"radio options:\n"
-	"  --center HZ        Centre frequency of the dongle. Default: the midpoint\n"
+	"  --center HZ        Centre frequency of the receiver. Default: the midpoint\n"
 	"                     of the carrier list, which always holds every carrier\n"
 	"                     in it. Give one to leave room on one side for a\n"
 	"                     carrier that a grant has yet to name. A baseband WAV\n"
@@ -111,17 +104,30 @@ static const char* USAGE =
 	"                     prints the value to use. Default 0.\n"
 	"  --rate HZ          Sample rate of the receiver, and so the width of one\n"
 	"                     span. \"run\" defaults to 3200000. \"sweep\" instead asks\n"
-	"                     the receiver for the widest rate it takes and reports\n"
-	"                     it, so give this only to hold it below that. An\n"
-	"                     RTL-SDR takes 225001-300000 and 900001-3200000 Hz and\n"
-	"                     nothing else, and its driver expects sample loss above\n"
-	"                     2400000; watch the dropped column of clock.log.\n"
+	"                     for a rate that holds the TETRA band (or a narrower\n"
+	"                     --band) in one span, with a little extra so a stick\n"
+	"                     that snaps or lists a coarse rate still covers, and\n"
+	"                     reports it. Give this only to hold it below that.\n"
+	"                     A rate that the link cannot carry (a Pluto on USB\n"
+	"                     2.0) steps down to one that it can.\n"
+	"                     Watch the dropped column of clock.log if the host\n"
+	"                     cannot keep up.\n"
 	"  --gain DB          Tuner gain of 0 to 100 dB, or \"auto\". The tuner takes\n"
 	"                     the nearest gain that it supports, and the start line\n"
 	"                     reports the gain that it took. Default auto.\n"
-	"  --agc              Turn on the digital AGC of the RTL2832. It is off by\n"
-	"                     default, and it is separate from the gain of the tuner.\n"
-	"  --device INDEX     Index of the RTL-SDR device. Default 0.\n"
+	"  --device INDEX     Index of the receiver. Default 0.\n"
+	"                     A live run auto-detects the receiver through SoapySDR.\n"
+	"                     If Soapy finds none, USB is scanned for a known stick.\n"
+	"                     No stick prints \"no SDR found\". A known stick that\n"
+	"                     Soapy does not list prints \"<name> found\", and what to\n"
+	"                     install or check.\n"
+	"  --rx CHANNEL       RX channel of the receiver. Default 0.\n"
+	"  --antenna NAME     RX antenna of the receiver (LNAL, LNAH, LNAW, ...).\n"
+	"                     Default: the driver default, but LNAW for a Lime.\n"
+	"                     A LimeSDR-USB with its antenna on RX1_L needs LNAL.\n"
+	"  --device-args ARGS Soapy device arguments, KEY=VALUE,... The driver reads\n"
+	"                     them. A USRP at a wide rate needs num_recv_frames=1024,\n"
+	"                     or its small receive buffer overflows. Default none.\n"
 	"\n"
 	"output options:\n"
 	"  --out DIR          Parent directory for the run directories. Default\n"
@@ -145,7 +151,7 @@ static const char* USAGE =
 	"                     the carriers that a grant revealed, so a restart keeps\n"
 	"                     them instead of learning them again.\n"
 	"\n"
-	"replay options (no dongle):\n"
+	"replay options (no receiver):\n"
 	"  --iq FILE          Read IQ samples from FILE. \"-\" means stdin. An SDR++\n"
 	"                     baseband WAV gives its own format, rate, centre and\n"
 	"                     start time. Raw input needs --fmt, --rate and --center.\n"
@@ -154,8 +160,8 @@ static const char* USAGE =
 	"                     directory and anchors the wall-clock map.\n"
 	"\n"
 	"tuning options:\n"
-	"  --queue-blocks N   Depth of the queue between the dongle and the carriers,\n"
-	"                     in blocks. The dongle makes about 400 blocks each\n"
+	"  --queue-blocks N   Depth of the queue between the receiver and the carriers,\n"
+	"                     in blocks. The receiver makes about 400 blocks each\n"
 	"                     second, so the default holds one second. A full queue\n"
 	"                     drops the new block and counts it in clock.log.\n"
 	"                     Default 400.\n"
@@ -195,10 +201,10 @@ static const char* USAGE =
 	"  --max-carriers N   How many candidates the decode stage takes, strongest\n"
 	"                     first. Default 15.\n"
 	"\n"
-	"\"sweep\" also takes --rate, --gain, --agc, --device and --tune-offset, with the\n"
-	"same defaults as \"run\".\n"
+	"\"sweep\" also takes --rate, --gain, --device, --rx, --antenna, --device-args and\n"
+	"--tune-offset, with the same defaults as \"run\".\n"
 	"\n"
-	"Close SDR++ before a run if it holds the dongle.\n";
+	"Close SDR++ before a run if it holds the receiver.\n";
 
 enum class Fmt { cf32, cs16, cu8, cs8 };
 
@@ -210,9 +216,11 @@ struct Args {
 	std::string start_utc;
 	std::vector<uint32_t> hz;
 	int device = 0;
+	int rx = 0;
+	const char* antenna = nullptr;
+	const char* device_args = nullptr;
 	// Below zero means the automatic gain of the tuner.
 	double gain_db = -1;
-	bool agc = false;
 	bool per_carrier = false;
 	size_t max_gssi = DEFAULT_MAX_GSSI;
 	size_t max_carriers = DEFAULT_MAX_CARRIERS;
@@ -223,7 +231,7 @@ struct Args {
 
 struct IqSource {
 	int fd = -1;
-	rtlsdr_dev* rtl = nullptr;
+	Radio* radio = nullptr;
 	Fmt fmt = Fmt::cu8;
 	double rate, center;
 	time_t start;
@@ -233,7 +241,7 @@ struct IqSource {
 
 [[noreturn]] static void die(const std::string& msg)
 {
-	std::cerr << "tetra-sniff: " << msg << "\n";
+	std::cerr << "tetra-analyze: " << msg << "\n";
 	exit(2);
 }
 
@@ -294,9 +302,9 @@ static SweepArgs parse_sweep_args(int argc, char** argv)
 {
 	// The whole of the spectrum that TETRA is given below 470 MHz, so a sweep
 	// with no arguments finds a network wherever it sits in it. A rate of 0
-	// means "ask the receiver for the widest span it can give".
-	SweepArgs s = { 380000000, 430000000, 0, 12500, DEFAULT_TUNE_OFFSET,
-			-1, false, 0, 0.2, 15, 6, 15 };
+	// means the widest span that still holds that allocation.
+	SweepArgs s = { TETRA_BAND_LO, TETRA_BAND_HI, 0, 12500, DEFAULT_TUNE_OFFSET,
+			-1, 0, 0.2, 15, 6, 15, 0, nullptr, nullptr };
 	for (int i = 1; i < argc; i++) {
 		std::string t = argv[i];
 		auto val = [&]() -> std::string { if (++i >= argc) die(t + " needs a value"); return argv[i]; };
@@ -316,14 +324,22 @@ static SweepArgs parse_sweep_args(int argc, char** argv)
 		else if (t == "--rate") s.rate = parse_double(val(), "--rate");
 		else if (t == "--tune-offset") s.tune_offset = parse_double(val(), "--tune-offset");
 		else if (t == "--device") s.device = (int)parse_ulong(val(), 255, "--device");
-		else if (t == "--agc") s.agc = true;
+		else if (t == "--rx") s.rx = (int)parse_ulong(val(), 255, "--rx");
+		else if (t == "--antenna") {
+			if (++i >= argc) die(t + " needs a value");
+			s.antenna = argv[i];
+		}
+		else if (t == "--device-args") {
+			if (++i >= argc) die(t + " needs a value");
+			s.device_args = argv[i];
+		}
 		else if (t == "--gain") {
 			std::string g = val();
 			s.gain_db = g == "auto" ? -1 : parse_double(g, "--gain");
 			if (g != "auto" && (s.gain_db < 0 || s.gain_db > 100))
 				die("--gain needs a gain of 0 to 100 dB, or \"auto\"");
 		}
-		else die("unknown option " + t + "\nRun \"tetra-sniff help\" for the options.");
+		else die("unknown option " + t + "\nRun \"tetra-analyze help\" for the options.");
 	}
 	if (s.step <= 0) die("--step needs a step above zero");
 	if (s.scan <= 0 || s.dwell <= 0) die("--scan and --dwell need a time above zero");
@@ -353,13 +369,21 @@ static Args parse_args(int argc, char** argv)
 			list_from_flag = true;
 		}
 		else if (s == "--device") a.device = (int)parse_ulong(val(), 255, "--device");
+		else if (s == "--rx") a.rx = (int)parse_ulong(val(), 255, "--rx");
+		else if (s == "--antenna") {
+			if (++i >= argc) die(s + " needs a value");
+			a.antenna = argv[i];
+		}
+		else if (s == "--device-args") {
+			if (++i >= argc) die(s + " needs a value");
+			a.device_args = argv[i];
+		}
 		else if (s == "--gain") {
 			std::string g = val();
 			a.gain_db = g == "auto" ? -1 : parse_double(g, "--gain");
 			if (g != "auto" && (a.gain_db < 0 || a.gain_db > 100))
 				die("--gain needs a gain of 0 to 100 dB, or \"auto\"");
 		}
-		else if (s == "--agc") a.agc = true;
 		else if (s == "--per-carrier") a.per_carrier = true;
 		else if (s == "--max-gssi") a.max_gssi = parse_count(val(), "--max-gssi");
 		else if (s == "--queue-blocks") a.queue_blocks = parse_count(val(), "--queue-blocks");
@@ -367,7 +391,7 @@ static Args parse_args(int argc, char** argv)
 		else if (s == "--max-carriers") a.max_carriers = parse_count(val(), "--max-carriers");
 		else if (s == "--no-learn") a.learn = false;
 		else if (s.size() > 1 && s[0] == '-' && !isdigit((unsigned char)s[1]))
-			die("unknown option " + s + "\nRun \"tetra-sniff help\" for the options.");
+			die("unknown option " + s + "\nRun \"tetra-analyze help\" for the options.");
 		else {
 			saw_positional = true;
 			a.hz.push_back(parse_hz(s));
@@ -378,7 +402,7 @@ static Args parse_args(int argc, char** argv)
 	if (a.hz.empty())
 		die("give at least one carrier, with --carriers or as DL_HZ arguments.\n"
 		    "The list must hold every control carrier of the network, because every\n"
-		    "grant arrives on one of those. Run \"tetra-sniff sweep\" to find them.");
+		    "grant arrives on one of those. Run \"tetra-analyze sweep\" to find them.");
 	std::vector<uint32_t> u = a.hz;
 	std::sort(u.begin(), u.end());
 	if (std::adjacent_find(u.begin(), u.end()) != u.end()) die("duplicate frequency");
@@ -540,7 +564,7 @@ static void write_learned(const std::string& path, const Allocations& alloc,
 	std::string tmp = path + ".tmp";
 	FILE* f = fopen(tmp.c_str(), "w");
 	if (!f) return;
-	fprintf(f, "# tetra-sniff remembers the carriers that a grant revealed.\n"
+	fprintf(f, "# tetra-analyze remembers the carriers that a grant revealed.\n"
 		   "# Delete this file to forget them. --no-learn stops it being written.\n");
 	// A grant revealed the ones marked "learned". The rest came from the command
 	// line. strtoul stops at the space, so an older reader still parses this.
@@ -555,36 +579,8 @@ static void write_learned(const std::string& path, const Allocations& alloc,
 static volatile sig_atomic_t stop_flag = 0;
 static void on_signal(int) { stop_flag = 1; }
 
-// --queue-blocks sets this before the reader thread starts. It is read only after that.
-static size_t rtl_queue_max = DEFAULT_QUEUE_BLOCKS;
 // --status sets this before the run starts. Zero turns the status line off.
 static double status_seconds = DEFAULT_STATUS;
-
-struct RtlQueue {
-	std::mutex mutex;
-	std::condition_variable ready;
-	std::deque<std::vector<uint8_t>> blocks;
-	// The mutex protects this counter. The parent reads it with the queue depth.
-	uint64_t dropped = 0;
-	bool done = false;
-};
-
-static void on_rtl_block(const uint8_t* data, uint32_t len, void* p)
-{
-	auto* q = (RtlQueue*)p;
-	{
-		std::lock_guard<std::mutex> lock(q->mutex);
-		// The queue holds 1 second of IQ data by default. An overflow drops the new block.
-		if (q->blocks.size() >= rtl_queue_max) {
-			// clock.log counts every drop. This line reports the first one at once.
-			if (q->dropped++ == 0)
-				std::cout << "tetra-sniff: RTL queue is full, blocks are dropped\n";
-			return;
-		}
-		q->blocks.emplace_back(data, data + len);
-	}
-	q->ready.notify_one();
-}
 
 static bool write_all(int fd, const void* p, size_t n)
 {
@@ -684,7 +680,7 @@ static void clock_tick(int fd, uint64_t vfo_samples, size_t queue, uint64_t drop
 	if (status_seconds <= 0 || mono.tv_sec - last_status < (time_t)status_seconds) return;
 	last_status = mono.tv_sec;
 	long up = (long)(mono.tv_sec - first_mono);
-	printf("tetra-sniff: up %ldh%02ldm  queue %zu  dropped %llu (+%llu)  samples %llu\n",
+	printf("tetra-analyze: up %ldh%02ldm  queue %zu  dropped %llu (+%llu)  samples %llu\n",
 	       up / 3600, (up % 3600) / 60, queue, (unsigned long long)dropped,
 	       (unsigned long long)(dropped - status_dropped), (unsigned long long)vfo_samples);
 	status_dropped = dropped;
@@ -717,9 +713,8 @@ int main(int argc, char** argv)
 		return 0;
 	}
 	if (cmd == "sweep") return sweep_main(parse_sweep_args(argc - 1, argv + 1));
-	if (cmd != "run") die("unknown command " + cmd + "\nRun \"tetra-sniff help\" for the commands.");
+	if (cmd != "run") die("unknown command " + cmd + "\nRun \"tetra-analyze help\" for the commands.");
 	Args a = parse_args(argc - 1, argv + 1);
-	rtl_queue_max = a.queue_blocks;
 	status_seconds = a.status;
 	IqSource src = open_iq(a);
 
@@ -745,10 +740,10 @@ int main(int argc, char** argv)
 			a.hz.push_back(hz);
 		}
 		if (a.hz.size() > before)
-			learned_note = "tetra-sniff: " + std::to_string(a.hz.size() - before) +
+			learned_note = "tetra-analyze: " + std::to_string(a.hz.size() - before) +
 				       " carrier(s) remembered from " + learn_path + "\n";
 		if (unreachable)
-			learned_note += "tetra-sniff: " + std::to_string(unreachable) +
+			learned_note += "tetra-analyze: " + std::to_string(unreachable) +
 					" remembered carrier(s) fall outside this span and were"
 					" dropped\n";
 	}
@@ -757,12 +752,12 @@ int main(int argc, char** argv)
 		// A per-carrier WAV is named for its frequency, so a slot that moves
 		// would have to rotate its files. Keep the list fixed instead.
 		if (pool != a.hz.size())
-			learned_note += "tetra-sniff: --per-carrier keeps the carrier list fixed,"
+			learned_note += "tetra-analyze: --per-carrier keeps the carrier list fixed,"
 					" so there are no free slots\n";
 		pool = a.hz.size();
 	}
 	if (pool < a.hz.size()) {
-		learned_note += "tetra-sniff: --max-carriers " + std::to_string(a.max_carriers) +
+		learned_note += "tetra-analyze: --max-carriers " + std::to_string(a.max_carriers) +
 				" is below the " + std::to_string(a.hz.size()) +
 				" carriers given, so the pool grows to fit them\n";
 		pool = a.hz.size();
@@ -770,18 +765,18 @@ int main(int argc, char** argv)
 	Allocations allocations = Allocations::create(a.hz, pool);
 	const std::string& run_dir = src.run_dir;
 	std::string start_iso = utc(src.start, "%Y-%m-%dT%H:%M:%SZ");
-	std::cout << "tetra-sniff: run dir " << run_dir << " start_utc " << start_iso
+	std::cout << "tetra-analyze: run dir " << run_dir << " start_utc " << start_iso
 		  << " rate " << (long long)src.rate << " center " << (long long)src.center << "\n";
 	// A log read months later must say which carriers the run actually followed.
 	{
-		std::string line = "tetra-sniff: " + std::to_string(a.hz.size()) + " carriers ";
+		std::string line = "tetra-analyze: " + std::to_string(a.hz.size()) + " carriers ";
 		for (size_t i = 0; i < a.hz.size(); i++)
 			line += (i ? "," : "") + std::to_string(a.hz[i]);
 		line += a.per_carrier ? " (per-carrier files on)\n" : "\n";
 		std::cout << line;
 		std::cout << learned_note;
 		if (pool > a.hz.size())
-			std::cout << "tetra-sniff: " + std::to_string(pool - a.hz.size()) +
+			std::cout << "tetra-analyze: " + std::to_string(pool - a.hz.size()) +
 					 " free carrier slot(s) for carriers that a grant names\n";
 	}
 
@@ -816,87 +811,95 @@ int main(int argc, char** argv)
 	}
 	close(voice_pipe[1]);
 
-	// Before rtl_open(): a child dying during USB enumeration must not have its
+	// Before radio_open(): a child dying during USB enumeration must not have its
 	// SIGCHLD delivered against the default disposition, which drops it.
 	struct sigaction sa = {};
 	sa.sa_handler = on_signal;
 	sigaction(SIGCHLD, &sa, nullptr);
 
-	if (src.fd < 0) {
-		int gain_tenth_db = a.gain_db < 0 ? -1 : (int)llround(a.gain_db * 10);
-		int applied = -1;
-		// The driver of the dongle prints its own banner. Keep it out of the log.
+	int block = iq_block(src.rate);
+	// A wide span goes through the filter bank, and each slot then filters
+	// only the sub-band that holds its carrier. FFTW plans the bank for some
+	// seconds, so this comes before the radio streams into a buffer that no
+	// one reads.
+	Channelizer bank;
+	bank.init(src.rate, block);
+	std::vector<dsp::channel::RxVFO> vfos(n);
+	std::vector<int> band(n);
+	{
+		// The resampler prints a line for each VFO. Keep it out of the log.
 		int saved = quiet_begin();
-		int rc = rtl_open(&src.rtl, (uint32_t)src.center, (uint32_t)src.rate, a.device, gain_tenth_db,
-				  a.agc, &applied);
+		// A free slot is parked at the centre. Its child discards the samples
+		// until the parent gives the slot a frequency.
+		for (size_t i = 0; i < n; i++) {
+			double rest;
+			band[i] = bank.channel_of(i < a.hz.size() ? (double)a.hz[i] + a.tune_offset - src.center : 0,
+						  &rest);
+			bank.use(band[i]);
+			vfos[i].init(nullptr, bank.out_rate(), VFO_RATE, VFO_BW, rest);
+		}
 		quiet_end(saved);
-		if (rc == -1) die("no RTL-SDR found");
-		if (rc == -5) die("no RTL-SDR at --device " + std::to_string(a.device));
-		if (rc == -2) die("RTL-SDR " + std::to_string(a.device) +
-				  " did not open (quit SDR++ if it is using the dongle)");
-		if (rc == -6) die("RTL-SDR failed to set the tuner gain");
-		if (rc == -7) die("RTL-SDR failed to set the AGC");
-		if (rc) die("RTL-SDR failed to tune");
-		// The tuner holds the gain in tenths of a dB, so one decimal is exact.
+	}
+	if (bank.channels() > 1)
+		std::cout << "tetra-analyze: filter bank of " + std::to_string(bank.channels()) +
+				 " sub-bands at " + std::to_string((long long)bank.out_rate()) + " S/s\n";
+
+	if (src.fd < 0) {
+		RadioOpen cfg{};
+		cfg.center_hz = (uint32_t)src.center;
+		cfg.rate_hz = (uint32_t)src.rate;
+		cfg.index = a.device;
+		cfg.channel = a.rx;
+		cfg.antenna = a.antenna;
+		cfg.args = a.device_args;
+		cfg.gain_tenth_db = a.gain_db < 0 ? -1 : (int)llround(a.gain_db * 10);
+		int saved = quiet_begin();
+		RadioErr rc = radio_open(&src.radio, cfg);
+		quiet_end(saved);
+		if (rc == RadioErr::bad_index)
+			die("there is no receiver at --device " + std::to_string(a.device));
+		if (rc == RadioErr::bad_channel)
+			die("there is no RX channel at --rx " + std::to_string(a.rx));
+		if (rc == RadioErr::bad_antenna)
+			die("the receiver has no antenna " + std::string(a.antenna ? a.antenna : ""));
+		if (rc != RadioErr::ok) die(radio_error(rc));
+		src.fmt = Fmt::cf32;
+		int applied = radio_gain_tenth_db(src.radio);
 		char gain[32] = "auto";
 		if (applied >= 0) snprintf(gain, sizeof gain, "%d.%d dB", applied / 10, applied % 10);
-		// One string, then one write. Another thread cannot split the line.
-		std::cout << "tetra-sniff: RTL-SDR " + std::to_string(a.device) + " " +
+		const char* drv = radio_driver(src.radio);
+		const char* ant = radio_antenna(src.radio);
+		std::cout << "tetra-analyze: radio " + std::string(drv && *drv ? drv : "?") + " " +
+				 std::to_string(a.device) + " " +
 				 std::to_string((long long)src.center) + " Hz @ " +
 				 std::to_string((long long)src.rate) + " S/s gain " + gain +
-				 " agc " + (a.agc ? "on" : "off") + "\n";
+				 " rx " + std::to_string(a.rx) +
+				 (ant && *ant ? std::string(" ") + ant : "") + "\n";
 	}
 
 	sigaction(SIGINT, &sa, nullptr);
 	sigaction(SIGTERM, &sa, nullptr);
 	// A dead stitch or carrier child ends the run. The handler has no SA_RESTART,
 	// so it also breaks the blocking read. Systemd starts a new tree.
-	// (SIGCHLD itself is installed above, before rtl_open.)
-
-	std::vector<dsp::channel::RxVFO> vfos(n);
-	{
-		// The resampler prints a line for each VFO. Keep it out of the log.
-		int saved = quiet_begin();
-		// A free slot is parked at the centre. Its child discards the samples
-		// until the parent gives the slot a frequency.
-		for (size_t i = 0; i < n; i++)
-			vfos[i].init(nullptr, src.rate, VFO_RATE, VFO_BW,
-				     i < a.hz.size() ? (double)a.hz[i] + a.tune_offset - src.center : 0);
-		quiet_end(saved);
-	}
 
 	int bytes_per = src.fmt == Fmt::cf32 ? 8 : src.fmt == Fmt::cs16 ? 4 : 2;
-	int block = (int)(src.rate / 10);
 	std::vector<uint8_t> raw(block * bytes_per);
 	auto* in = dsp::buffer::alloc<dsp::complex_t>(block);
 	std::vector<dsp::complex_t*> tmp(n);
 	for (auto& p : tmp) p = dsp::buffer::alloc<dsp::complex_t>(block);
+	std::vector<int> made(n);
 	size_t have = src.pending.size();
 	memcpy(raw.data(), src.pending.data(), have);
-	RtlQueue rtl_queue;
-	std::thread rtl_thread;
-	if (src.rtl) {
-		uint32_t async_bytes = (uint32_t)llround(src.rate / (200.0 * 512.0)) * 512;
-		rtl_thread = std::thread([&] {
-			rtl_read_async(src.rtl, on_rtl_block, &rtl_queue, async_bytes);
-			{
-				std::lock_guard<std::mutex> lock(rtl_queue.mutex);
-				rtl_queue.done = true;
-			}
-			rtl_queue.ready.notify_one();
-		});
-	}
 
 	int clock_fd = open((run_dir + "/clock.log").c_str(), O_CREAT | O_APPEND | O_WRONLY, 0644);
 	if (clock_fd < 0) die(run_dir + "/clock.log: " + strerror(errno));
 	// dprintf has no fixed buffer, so a long run_dir cannot overflow one.
 	// The centre and the carriers make the run directory describe its own run,
 	// which is what lets a reader place the recordings in the band.
-	dprintf(clock_fd, "# tetra-sniff run=%s start_utc=%s iq_rate=%.0f vfo_rate=%.0f center=%.0f\n"
+	dprintf(clock_fd, "# tetra-analyze run=%s start_utc=%s iq_rate=%.0f vfo_rate=%.0f center=%.0f\n"
 			  "# utc vfo_sample queue dropped event\n",
 		run_dir.c_str(), start_iso.c_str(), src.rate, VFO_RATE, src.center);
 	log_previous_run(clock_fd, a.out, run_dir);
-	// The dongle is open and every child runs. systemd may start what depends on us.
 	sd_notify("READY=1");
 	// Which carriers a grant revealed, as against those the command line gave.
 	std::set<uint32_t> learned_hz;
@@ -905,49 +908,49 @@ int main(int argc, char** argv)
 	uint64_t dropped = 0;
 
 	while (!stop_flag) {
-		ssize_t r;
-		if (src.rtl) {
-			std::vector<uint8_t> next;
-			{
-				std::unique_lock<std::mutex> lock(rtl_queue.mutex);
-				rtl_queue.ready.wait(lock, [&] {
-					return stop_flag || rtl_queue.done || !rtl_queue.blocks.empty();
-				});
-				if (stop_flag || (rtl_queue.done && rtl_queue.blocks.empty())) break;
-				next = std::move(rtl_queue.blocks.front());
-				rtl_queue.blocks.pop_front();
-				queue = rtl_queue.blocks.size();
-				dropped = rtl_queue.dropped;
+		int cnt = 0;
+		if (src.radio) {
+			int got = radio_read(src.radio, (float*)in, block);
+			if (got < 0) {
+				std::cout << "tetra-analyze: the receiver stopped\n";
+				break;
 			}
-			r = next.size();
-			memcpy(raw.data() + have, next.data(), next.size());
+			if (got == 0) continue;
+			cnt = got;
+			dropped = radio_overflows(src.radio);
 		} else {
-			r = read(src.fd, raw.data() + have, raw.size() - have);
+			ssize_t r = read(src.fd, raw.data() + have, raw.size() - have);
+			if (r < 0) {
+				if (errno == EINTR) continue;
+				std::cout << "tetra-analyze: read: " + std::string(strerror(errno)) + "\n";
+				break;
+			}
+			have += r;
+			// A pipe gives 64 KB at a time. A wide span waits for a whole
+			// block, so that each pass gives the threads of the bank enough
+			// work. At the end of the input it takes what is left.
+			if (r > 0 && bank.channels() > 1 && have < raw.size()) continue;
+			if (r == 0 && have < (size_t)bytes_per) break;
+			cnt = (int)(have / bytes_per);
+			to_cf32(src.fmt, raw.data(), cnt, in);
+			have -= (size_t)cnt * bytes_per;
+			memmove(raw.data(), raw.data() + (size_t)cnt * bytes_per, have);
 		}
-		if (r < 0) {
-			if (!src.rtl && errno == EINTR) continue;
-			// One string, then one write. The RTL thread cannot split the line.
-			std::cout << "tetra-sniff: read: " + std::string(strerror(errno)) + "\n";
-			break;
-		}
-		if (r == 0) {
-			if (src.rtl) continue;
-			break;
-		}
-		have += r;
-		int cnt = have / bytes_per;
-		to_cf32(src.fmt, raw.data(), cnt, in);
-		have -= cnt * bytes_per;
-		memmove(raw.data(), raw.data() + cnt * bytes_per, have);
+		int sub = bank.process(cnt, in);
+		// The slots are independent, so the workers of the bank share them.
+		// Without a bank there is one worker, and this is the plain loop.
+		int nw = bank.workers();
+		run_parallel(nw, [&](int w) {
+			for (size_t i = w; i < n; i += nw)
+				made[i] = pipes[i] >= 0 ? vfos[i].process(sub, bank.out(band[i]), tmp[i]) : 0;
+		});
 		for (size_t i = 0; i < n; i++) {
 			if (pipes[i] < 0) continue;
-			int m = vfos[i].process(cnt, in, tmp[i]);
+			int m = made[i];
 			// Every VFO gets the same input count. Child 0 counts exactly these samples.
 			if (!i) vfo_samples += m;
 			if (write_all(pipes[i], tmp[i], m * sizeof(dsp::complex_t))) continue;
-			// One dead carrier child stops the run. Systemd starts a new tree.
-			// One string, then one write. The RTL thread cannot split the line.
-			std::cout << "tetra-sniff: " + std::to_string(a.hz[i]) + " child stopped reading: " +
+			std::cout << "tetra-analyze: " + std::to_string(a.hz[i]) + " child stopped reading: " +
 					 strerror(errno) + "\n";
 			close(pipes[i]);
 			pipes[i] = -1;
@@ -960,8 +963,11 @@ int main(int argc, char** argv)
 		while (allocations.take(&d)) {
 			int slot = allocations.assign(d.hz);
 			if (slot < 0) continue;
-			vfos[slot].setOffset((double)d.hz + a.tune_offset - src.center);
-			std::cout << "tetra-sniff: slot " + std::to_string(slot) + " takes " +
+			double rest;
+			band[slot] = bank.channel_of((double)d.hz + a.tune_offset - src.center, &rest);
+			bank.use(band[slot]);
+			vfos[slot].setOffset(rest);
+			std::cout << "tetra-analyze: slot " + std::to_string(slot) + " takes " +
 					 std::to_string(d.hz) + " Hz, granted to GSSI " +
 					 std::to_string(d.ssi) + " by " + std::to_string(d.control_hz) +
 					 " Hz\n";
@@ -972,10 +978,7 @@ int main(int argc, char** argv)
 		clock_tick(clock_fd, vfo_samples, queue, dropped);
 	}
 	close(clock_fd);
-	if (src.rtl) {
-		rtl_cancel_async(src.rtl);
-		rtl_thread.join();
-	}
+	if (src.radio) radio_stop(src.radio);
 
 	for (size_t i = 0; i < n; i++)
 		if (pipes[i] >= 0) close(pipes[i]);
@@ -984,16 +987,16 @@ int main(int argc, char** argv)
 		int st = 0;
 		while (waitpid(pids[i], &st, 0) < 0 && errno == EINTR) {}
 		int code = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
-		if (code) std::cout << "tetra-sniff: " << a.hz[i] << " exited " << code << "\n";
+		if (code) std::cout << "tetra-analyze: " << a.hz[i] << " exited " << code << "\n";
 		worst = std::max(worst, code);
 	}
 	int stitch_status = 0;
 	while (waitpid(stitch_pid, &stitch_status, 0) < 0 && errno == EINTR) {}
 	int stitch_code = WIFEXITED(stitch_status) ? WEXITSTATUS(stitch_status) : 128 + WTERMSIG(stitch_status);
-	if (stitch_code) std::cout << "tetra-sniff: stitch exited " << stitch_code << "\n";
+	if (stitch_code) std::cout << "tetra-analyze: stitch exited " << stitch_code << "\n";
 	worst = std::max(worst, stitch_code);
 	dsp::buffer::free(in);
 	for (auto* p : tmp) dsp::buffer::free(p);
-	rtl_close(src.rtl);
+	radio_close(src.radio);
 	return worst;
 }

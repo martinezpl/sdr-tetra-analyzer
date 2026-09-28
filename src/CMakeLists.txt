@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(tetra_sniff C CXX)
+project(tetra_analyze C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -63,24 +63,67 @@ if (NOT VOLK_INCLUDE_DIR OR NOT VOLK_LIBRARY)
     endif ()
 endif ()
 
-find_library(RTLSDR_LIBRARY NAMES rtlsdr rtlsdr.0)
-if (NOT RTLSDR_LIBRARY)
+# The filter bank of a wide span does its FFT with FFTW, in single precision.
+find_path(FFTW_INCLUDE_DIR fftw3.h)
+find_library(FFTW_LIBRARY fftw3f)
+if (NOT FFTW_INCLUDE_DIR OR NOT FFTW_LIBRARY)
     if (APPLE)
-        message(FATAL_ERROR "librtlsdr not found. Install it: brew install librtlsdr")
+        message(FATAL_ERROR "fftw not found. Install it: brew install fftw")
     else ()
-        message(FATAL_ERROR "librtlsdr not found. Install it: sudo apt install librtlsdr-dev")
+        message(FATAL_ERROR "fftw not found. Install it: sudo apt install libfftw3-dev")
     endif ()
 endif ()
 
-add_executable(tetra-sniff main.cpp child.cpp recorder.cpp allocations.cpp rtl.cpp stitch.cpp sweep.cpp ${DEC_SRC})
-target_include_directories(tetra-sniff PRIVATE . ${SRC} ${DEC}/src ${DEC}/codec ${SDRPP_CORE_ROOT}/src ${VOLK_INCLUDE_DIR})
-target_link_libraries(tetra-sniff PRIVATE ${VOLK_LIBRARY} ${RTLSDR_LIBRARY})
+find_package(SoapySDR CONFIG QUIET)
+if (NOT SoapySDR_FOUND)
+    find_package(PkgConfig QUIET)
+    if (PkgConfig_FOUND)
+        pkg_check_modules(SOAPYSDR SoapySDR)
+    endif ()
+endif ()
+if (NOT SoapySDR_FOUND AND NOT SOAPYSDR_FOUND)
+    if (APPLE)
+        message(FATAL_ERROR "SoapySDR not found. Install it: brew install soapysdr")
+    else ()
+        message(FATAL_ERROR "SoapySDR not found. Install it: sudo apt install libsoapysdr-dev")
+    endif ()
+endif ()
+
+# Factories come from plugins on disk, not from linking SoapySDR. ./build.sh
+# installs the ones this OS ships. A configure with none still builds: --iq
+# does not need a stick.
+find_program(SOAPYSDRUTIL_EXECUTABLE NAMES SoapySDRUtil)
+if (SOAPYSDRUTIL_EXECUTABLE)
+    execute_process(COMMAND ${SOAPYSDRUTIL_EXECUTABLE} --info
+        OUTPUT_VARIABLE SOAPY_INFO ERROR_QUIET)
+    string(REGEX MATCHALL "Module found:[^\n]+" SOAPY_MOD_LINES "${SOAPY_INFO}")
+    if (SOAPY_MOD_LINES)
+        message(STATUS "SoapySDR plugins:")
+        foreach (line IN LISTS SOAPY_MOD_LINES)
+            message(STATUS "  ${line}")
+        endforeach ()
+    else ()
+        message(WARNING
+            "SoapySDR loaded no device plugins. sweep/run enumerate() will be empty. "
+            "Run ./build.sh (or install a Soapy module) so the receiver is visible.")
+    endif ()
+endif ()
+
+add_executable(tetra-analyze main.cpp child.cpp recorder.cpp allocations.cpp radio.cpp stitch.cpp sweep.cpp pfb.cpp ${DEC_SRC})
+target_include_directories(tetra-analyze PRIVATE . ${SRC} ${DEC}/src ${DEC}/codec ${SDRPP_CORE_ROOT}/src ${VOLK_INCLUDE_DIR} ${FFTW_INCLUDE_DIR})
+target_link_libraries(tetra-analyze PRIVATE ${VOLK_LIBRARY} ${FFTW_LIBRARY})
+if (SoapySDR_FOUND)
+    target_link_libraries(tetra-analyze PRIVATE SoapySDR)
+else ()
+    target_include_directories(tetra-analyze PRIVATE ${SOAPYSDR_INCLUDE_DIRS})
+    target_link_libraries(tetra-analyze PRIVATE ${SOAPYSDR_LIBRARIES})
+endif ()
 # -fwrapv keeps signed overflow defined. L_add() in tetra_op.c detects overflow with it.
-target_compile_options(tetra-sniff PRIVATE $<$<COMPILE_LANGUAGE:C>:-fwrapv;-O2>)
-# The CLI lands at the top of the repository, so "./tetra-sniff run" works after a
+target_compile_options(tetra-analyze PRIVATE $<$<COMPILE_LANGUAGE:C>:-fwrapv;-O2>)
+# The CLI lands at the top of the repository, so "./tetra-analyze run" works after a
 # build. The $<1:...> wrapper stops a multi-config generator from adding a
 # per-configuration directory below it.
-set_target_properties(tetra-sniff PROPERTIES RUNTIME_OUTPUT_DIRECTORY "$<1:${ROOT}>")
+set_target_properties(tetra-analyze PROPERTIES RUNTIME_OUTPUT_DIRECTORY "$<1:${ROOT}>")
 
 add_executable(gen_iq test/gen_iq.cpp)
 
@@ -90,6 +133,21 @@ target_include_directories(events_test PRIVATE . ${DEC}/src)
 add_executable(allocations_test test/allocations_test.cpp allocations.cpp)
 target_include_directories(allocations_test PRIVATE .)
 
+add_executable(radio_test test/radio_test.cpp radio.cpp)
+target_include_directories(radio_test PRIVATE .)
+if (SoapySDR_FOUND)
+    target_link_libraries(radio_test PRIVATE SoapySDR)
+else ()
+    target_include_directories(radio_test PRIVATE ${SOAPYSDR_INCLUDE_DIRS})
+    target_link_libraries(radio_test PRIVATE ${SOAPYSDR_LIBRARIES})
+endif ()
+
+add_executable(pfb_test test/pfb_test.cpp pfb.cpp)
+target_include_directories(pfb_test PRIVATE . ${SDRPP_CORE_ROOT}/src ${VOLK_INCLUDE_DIR} ${FFTW_INCLUDE_DIR})
+target_link_libraries(pfb_test PRIVATE ${VOLK_LIBRARY} ${FFTW_LIBRARY})
+
 enable_testing()
 add_test(NAME events_test COMMAND events_test)
 add_test(NAME allocations_test COMMAND allocations_test)
+add_test(NAME radio_test COMMAND radio_test)
+add_test(NAME pfb_test COMMAND pfb_test)

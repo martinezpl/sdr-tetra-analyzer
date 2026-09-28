@@ -13,16 +13,17 @@
 // grant arrives on them.
 
 #include "demod_chain.h"
-#include "rtl.h"
+#include "pfb.h"
+#include "radio.h"
 #include "sweep.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <map>
 #include <string>
 #include <vector>
 
@@ -43,7 +44,7 @@ struct Channel {
 	uint32_t hz;
 	double power = 0;   // sum of the squared magnitude
 	uint64_t n = 0;     // samples behind that sum
-	int span = -1;      // which dongle centre measured it
+	int span = -1;
 	double snr = 0;     // dB above the noise floor of its own span
 	bool tested = false;
 	bool locked = false;
@@ -61,11 +62,15 @@ struct Probe {
 	tetra_mac_state* tms = nullptr;
 	tetra_rx_state* trs = nullptr;
 	size_t chan = 0;
+	int band = 0;           // the sub-band of the filter bank that holds it
 };
 
 // A carrier this strong has settled, so its frequency estimate is worth more
 // than one that barely held lock.
 static const double STRONG_DB = 12.0;
+
+// Long enough for a strong carrier to lock, which takes 0.2 to 1.7 s.
+static const double CAL_SECONDS = 3.0;
 
 // A carrier whose own frequency error is worth believing: the median of the
 // samples taken while it held lock. The median, because an FLL that slips for
@@ -77,14 +82,43 @@ double median_of(std::vector<double> v)
 	return v[v.size() / 2];
 }
 
-void cu8_to_cf32(const uint8_t* raw, int n, dsp::complex_t* out)
+// The scan and the dwell count their time in blocks, so a read must fill the
+// whole block. A driver gives at most one of its own buffers for each read,
+// and SoapyRTLSDR gives 131072 samples, which is 41% of a block at 3.2 MS/s.
+int read_live(Radio* r, dsp::complex_t* in, int n)
 {
-	for (int i = 0; i < n; i++)
-		out[i] = { (raw[2 * i] - 127.4f) / 128.0f, (raw[2 * i + 1] - 127.4f) / 128.0f };
+	int have = 0;
+	while (have < n) {
+		int got = radio_read(r, (float*)(in + have), n - have);
+		if (got < 0) return -1;
+		have += got;
+	}
+	return have;
 }
 
-// main.cpp keeps a carrier 15 kHz clear of the edge, so the scan does too.
-double usable_half(double rate) { return rate / 2 - 15e3; }
+// The samples that arrive in one second of reading, for each second. The
+// first 0.3 s only empties buffers that filled before anyone read them.
+double delivered_rate(Radio* r, dsp::complex_t* buf, int n)
+{
+	using clk = std::chrono::steady_clock;
+	auto since = [](clk::time_point t) {
+		return std::chrono::duration<double>(clk::now() - t).count();
+	};
+	auto t0 = clk::now();
+	while (since(t0) < 0.3)
+		if (radio_read(r, (float*)buf, n) < 0) return -1;
+	uint64_t got = 0;
+	double s = 0;
+	for (t0 = clk::now(); (s = since(t0)) < 1.0;) {
+		int k = radio_read(r, (float*)buf, n);
+		if (k < 0) return -1;
+		got += (uint64_t)k;
+	}
+	return got / s;
+}
+
+// A carrier is kept SWEEP_EDGE_HZ clear of the edge, so the scan does too.
+double usable_half(double rate) { return rate / 2 - SWEEP_EDGE_HZ; }
 
 // The dongle rolls off well before the edge of its span. Past this point a
 // carrier still decodes, but it loses SNR, so a suggested centre avoids it.
@@ -167,7 +201,7 @@ double choose_center(const std::vector<uint32_t>& hz, const std::vector<double>&
 int sweep_main(const SweepArgs& a)
 {
 	if (a.band_hi <= a.band_lo) {
-		fprintf(stderr, "tetra-sniff: --band needs LOW:HIGH with HIGH above LOW\n");
+		fprintf(stderr, "tetra-analyze: --band needs LOW:HIGH with HIGH above LOW\n");
 		return 2;
 	}
 
@@ -176,77 +210,125 @@ int sweep_main(const SweepArgs& a)
 	for (double hz = std::ceil(a.band_lo / a.step) * a.step; hz <= a.band_hi; hz += a.step)
 		chans.push_back(Channel{ (uint32_t)llround(hz) });
 	if (chans.empty()) {
-		fprintf(stderr, "tetra-sniff: the band holds no channel at a step of %.0f Hz\n", a.step);
+		fprintf(stderr, "tetra-analyze: the band holds no channel at a step of %.0f Hz\n", a.step);
 		return 2;
 	}
 
 	// The receiver is opened before the spans are planned, because the rate it
 	// takes decides how wide a span is and so how many there are.
-	rtlsdr_dev* rtl = nullptr;
-	int applied = -1;
-	int gain_tenth = a.gain_db < 0 ? -1 : (int)llround(a.gain_db * 10);
-	uint32_t open_rate = (uint32_t)(a.rate ? a.rate : 3200000);
-	int rc = rtl_open(&rtl, (uint32_t)((a.band_lo + a.band_hi) / 2), open_rate, a.device,
-			  gain_tenth, a.agc, &applied);
-	if (rc) {
-		fprintf(stderr, "tetra-sniff: %s\n", rtl_error(rc));
+	RadioOpen cfg{};
+	cfg.center_hz = (uint32_t)((a.band_lo + a.band_hi) / 2);
+	cfg.rate_hz = (uint32_t)a.rate;
+	double width = a.band_hi - a.band_lo;
+	uint32_t one_span_cap = 0;
+	if (!a.rate) {
+		double span = width > TETRA_SPAN_HZ ? TETRA_SPAN_HZ : width;
+		one_span_cap = (uint32_t)llround((span + 2 * SWEEP_EDGE_HZ) * SWEEP_ONE_SPAN_MARGIN);
+		cfg.max_rate_hz = one_span_cap;
+	}
+	cfg.index = a.device;
+	cfg.channel = a.rx;
+	cfg.antenna = a.antenna;
+	cfg.args = a.device_args;
+	cfg.gain_tenth_db = a.gain_db < 0 ? -1 : (int)llround(a.gain_db * 10);
+	Radio* radio = nullptr;
+	RadioErr rc = radio_open(&radio, cfg);
+	if (rc != RadioErr::ok) {
+		fprintf(stderr, "tetra-analyze: %s\n", radio_error(rc));
 		return 2;
 	}
 
-	// Without --rate, ask the receiver for the widest span it will give, rather
-	// than assume a limit. A wider span is fewer retunes and fewer runs.
-	double rate = a.rate;
+	// Rate 0 asked for a window that holds the TETRA allocation (or a
+	// narrower --band) in one span. The IQ block size, not the rate, is
+	// what has to stay inside the SDR++ work buffers.
+	double rate = radio_rate(radio);
 	if (!rate) {
-		uint32_t got = rtl_max_rate(rtl, 0);
-		if (!got) {
-			fprintf(stderr, "tetra-sniff: the RTL-SDR took no sample rate\n");
-			rtl_close(rtl);
-			return 2;
-		}
-		rate = got;
-		printf("tetra-sniff: the receiver takes %.3f MS/s, so a span is %.3f MHz\n",
-		       rate / 1e6, (2 * usable_half(rate)) / 1e6);
-	}
-	if (rtl_set_rate(rtl, (uint32_t)rate)) {
-		fprintf(stderr, "tetra-sniff: the RTL-SDR did not take the sample rate\n");
-		rtl_close(rtl);
+		fprintf(stderr, "tetra-analyze: %s\n", radio_error(RadioErr::bad_rate));
+		radio_close(radio);
 		return 2;
 	}
+	// The IQ window is `rate` hertz wide. If that covers the search band,
+	// one tune is enough. usable_half is tighter (15 kHz off each edge);
+	// a stick that snapped to exactly the band width would otherwise
+	// miss by 30 kHz and the 95% overlap loop would add a second span.
+	if (!a.rate && width > rate && one_span_cap) {
+		uint32_t wider = radio_max_rate(radio, one_span_cap);
+		if (wider > rate && width <= wider &&
+		    radio_set_rate(radio, wider) == RadioErr::ok) {
+			double got = radio_rate(radio);
+			rate = got ? got : wider;
+		}
+	}
+	// A link can be slower than the rate that the receiver lists. A Pluto on
+	// USB 2.0 takes 10 MS/s but delivers 7.1, and it drops the rest with no
+	// report. A sweep with gaps decodes badly, and its run lines lose samples
+	// too. So measure what arrives, and step down to a rate the link carries.
+	if (!a.rate) {
+		int probe_n = iq_block(rate);
+		auto* probe = dsp::buffer::alloc<dsp::complex_t>(probe_n);
+		for (int tries = 0; tries < 4; tries++) {
+			double got = delivered_rate(radio, probe, probe_n);
+			if (got < 0 || got >= 0.95 * rate) break;
+			// A multiple of 500 kHz, so that the filter bank can split it.
+			double want = std::floor(0.9 * got / 500000) * 500000;
+			uint32_t lower = radio_max_rate(radio, (uint32_t)want);
+			if (!lower || lower >= rate || radio_set_rate(radio, lower) != RadioErr::ok) break;
+			printf("tetra-analyze: the link delivers %.1f of %.1f MS/s, so the sweep takes %.1f MS/s\n",
+			       got / 1e6, rate / 1e6, radio_rate(radio) / 1e6);
+			rate = radio_rate(radio);
+		}
+		dsp::buffer::free(probe);
+	}
+	if (!a.rate)
+		printf("tetra-analyze: the receiver takes %.3f MS/s, so a span is %.3f MHz\n",
+		       rate / 1e6, (2 * usable_half(rate)) / 1e6);
 
-	// The dongle centres that cover the band, with a little overlap.
 	double half = usable_half(rate);
 	std::vector<double> centers;
-	if (a.band_hi - a.band_lo <= 2 * half) {
+	if (width <= rate) {
 		centers.push_back((a.band_lo + a.band_hi) / 2);
 	} else {
 		for (double c = a.band_lo + half; c - half < a.band_hi; c += 2 * half * 0.95)
 			centers.push_back(c);
 	}
 
-	printf("tetra-sniff: sweep %.3f-%.3f MHz, %.1f kHz raster, %.1f MS/s, %zu span(s)\n",
-	       a.band_lo / 1e6, a.band_hi / 1e6, a.step / 1e3, rate / 1e6, centers.size());
+	const char* ant = radio_antenna(radio);
+	printf("tetra-analyze: sweep %.3f-%.3f MHz, %.1f kHz raster, %.1f MS/s, %zu span(s), rx %d%s%s\n",
+	       a.band_lo / 1e6, a.band_hi / 1e6, a.step / 1e3, rate / 1e6, centers.size(),
+	       a.rx, (ant && *ant) ? " " : "", (ant && *ant) ? ant : "");
 
-	int block = (int)(rate / 10);
-	std::vector<uint8_t> raw(block * 2);
+	int block = iq_block(rate);
 	auto* in = dsp::buffer::alloc<dsp::complex_t>(block);
 	auto* out = dsp::buffer::alloc<dsp::complex_t>(block);
 	auto* syms = dsp::buffer::alloc<dsp::complex_t>(block);
 	auto* dibits = dsp::buffer::alloc<uint8_t>(block);
 	auto* bits = dsp::buffer::alloc<uint8_t>(2 * block);
-	int scan_blocks = std::max(1, (int)llround(a.scan * 10));
+	int scan_blocks = std::max(1, (int)llround(a.scan * rate / block));
+	// A wide span goes through the filter bank, and each VFO then filters one
+	// narrow sub-band. Its workers also share the VFOs of the scan.
+	Channelizer bank;
+	bank.init(rate, block);
+	int nw = bank.workers();
+	if (bank.channels() > 1)
+		printf("tetra-analyze: filter bank of %d sub-bands at %.0f S/s\n", bank.channels(),
+		       bank.out_rate());
+	std::vector<dsp::complex_t*> outw(nw, out);
+	for (int w = 1; w < nw; w++) outw[w] = dsp::buffer::alloc<dsp::complex_t>(block);
 	// A group holds every VFO that one pass of the input feeds. The VFOs are
-	// built once: setOffset moves the rotator, and the filter taps stay.
-	const size_t GROUP = 32;
+	// built once: setOffset moves the rotator, and the filter taps stay. On a
+	// sub-band a VFO is cheap, so each worker takes 32 of them.
+	const size_t GROUP = 32 * nw;
 	int status = 0;
 	int saved = quiet_begin();
 	std::vector<dsp::channel::RxVFO> vfos(GROUP);
-	for (auto& v : vfos) v.init(nullptr, rate, VFO_RATE, VFO_BW, 0);
+	std::vector<int> vband(GROUP);
+	for (auto& v : vfos) v.init(nullptr, bank.out_rate(), VFO_RATE, VFO_BW, 0);
 	quiet_end(saved);
 
 	// Stage 1: measure the power of every channel.
 	for (size_t s = 0; s < centers.size() && !status; s++) {
-		if (s && rtl_set_center(rtl, (uint32_t)centers[s])) {
-			fprintf(stderr, "tetra-sniff: the RTL-SDR did not retune\n");
+		if (radio_set_center(radio, (uint32_t)centers[s]) != RadioErr::ok) {
+			fprintf(stderr, "tetra-analyze: %s\n", radio_error(RadioErr::bad_tune));
 			status = 2;
 			break;
 		}
@@ -255,33 +337,42 @@ int sweep_main(const SweepArgs& a)
 			if (chans[i].span < 0 &&
 			    std::fabs((double)chans[i].hz + a.tune_offset - centers[s]) <= half)
 				idx.push_back(i);
-		printf("tetra-sniff: span %zu at %.3f MHz, %zu channels\n", s + 1, centers[s] / 1e6,
+		printf("tetra-analyze: span %zu at %.3f MHz, %zu channels\n", s + 1, centers[s] / 1e6,
 		       idx.size());
 		for (size_t g = 0; g < idx.size() && !status; g += GROUP) {
 			size_t n = std::min(GROUP, idx.size() - g);
-			for (size_t j = 0; j < n; j++)
-				vfos[j].setOffset((double)chans[idx[g + j]].hz + a.tune_offset -
-						  centers[s]);
+			bank.clear_use();
+			for (size_t j = 0; j < n; j++) {
+				double rest;
+				vband[j] = bank.channel_of((double)chans[idx[g + j]].hz + a.tune_offset -
+							   centers[s], &rest);
+				bank.use(vband[j]);
+				vfos[j].setOffset(rest);
+			}
 			for (int b = 0; b < scan_blocks; b++) {
-				int got = rtl_read(rtl, raw.data(), (int)raw.size());
-				if (got <= 0) {
-					fprintf(stderr, "tetra-sniff: the RTL-SDR stopped\n");
+				int cnt = read_live(radio, in, block);
+				if (cnt < 0) {
+					fprintf(stderr, "tetra-analyze: the receiver stopped\n");
 					status = 2;
 					break;
 				}
-				int cnt = got / 2;
-				cu8_to_cf32(raw.data(), cnt, in);
-				for (size_t j = 0; j < n; j++) {
-					int m = vfos[j].process(cnt, in, out);
-					double p = 0;
-					for (int k = 0; k < m; k++)
-						p += (double)out[k].re * out[k].re +
-						     (double)out[k].im * out[k].im;
-					Channel& c = chans[idx[g + j]];
-					c.power += p;
-					c.n += m;
-					c.span = (int)s;
-				}
+				int sub = bank.process(cnt, in);
+				// Each VFO adds to its own channel only, so the workers
+				// need no lock.
+				run_parallel(nw, [&](int w) {
+					dsp::complex_t* o = outw[w];
+					for (size_t j = w; j < n; j += nw) {
+						int m = vfos[j].process(sub, bank.out(vband[j]), o);
+						double p = 0;
+						for (int k = 0; k < m; k++)
+							p += (double)o[k].re * o[k].re +
+							     (double)o[k].im * o[k].im;
+						Channel& c = chans[idx[g + j]];
+						c.power += p;
+						c.n += m;
+						c.span = (int)s;
+					}
+				});
 			}
 		}
 	}
@@ -312,8 +403,10 @@ int sweep_main(const SweepArgs& a)
 		}
 		if (best) peaks.push_back(i);
 	}
-	printf("tetra-sniff: %zu peak(s) at or above %.1f dB over the noise floor\n", peaks.size(),
-	       a.threshold_db);
+	// After a receiver failure the counts mean nothing, so say nothing.
+	if (!status)
+		printf("tetra-analyze: %zu peak(s) at or above %.1f dB over the noise floor\n", peaks.size(),
+		       a.threshold_db);
 
 	// Group the peaks into spans to decode in. A band wider than one span needs
 	// several, and every one that holds a peak is worth a dwell, because a
@@ -332,79 +425,148 @@ int sweep_main(const SweepArgs& a)
 		}
 		groups.push_back({ k });
 	}
-	printf("tetra-sniff: %zu span(s) to decode\n", groups.size());
+	if (!status) printf("tetra-analyze: %zu span(s) to decode\n", groups.size());
 
-	// Stage 2: decode the candidates of each group in turn.
-	for (size_t g = 0; g < groups.size() && !status; g++) {
-		std::vector<size_t>& cand = groups[g];
-		double lo = (double)chans[cand.front()].hz;
-		double hi = (double)chans[cand.back()].hz;
-		double decode_center = std::round(((lo + hi) / 2 + a.tune_offset) / 10000) * 10000;
-		std::sort(cand.begin(), cand.end(),
+	// A span with more candidates than --max-carriers gets more than one dwell,
+	// strongest first. A wide span holds the whole band, so it often does.
+	struct Dwell {
+		size_t span, part, parts;
+		double center;
+		std::vector<size_t> cand;
+	};
+	std::vector<Dwell> dwells;
+	for (size_t g = 0; g < groups.size(); g++) {
+		std::vector<size_t>& all = groups[g];
+		double lo = (double)chans[all.front()].hz;
+		double hi = (double)chans[all.back()].hz;
+		double center = std::round(((lo + hi) / 2 + a.tune_offset) / 10000) * 10000;
+		std::sort(all.begin(), all.end(),
 			  [&](size_t x, size_t y) { return chans[x].snr > chans[y].snr; });
-		if (cand.size() > a.max_carriers) {
-			printf("tetra-sniff: --max-carriers is %zu, so %zu weaker peak(s) of this"
-			       " span go undecoded\n", a.max_carriers, cand.size() - a.max_carriers);
-			cand.resize(a.max_carriers);
-		}
-		printf("tetra-sniff: span %zu of %zu, decode %zu candidate(s) at %.3f MHz for %.0f s\n",
-		       g + 1, groups.size(), cand.size(), decode_center / 1e6, a.dwell);
-		if (rtl_set_center(rtl, (uint32_t)decode_center)) {
-			fprintf(stderr, "tetra-sniff: the RTL-SDR did not retune\n");
+		size_t parts = (all.size() + a.max_carriers - 1) / a.max_carriers;
+		for (size_t p = 0; p < parts; p++)
+			dwells.push_back({ g, p, parts, center,
+					   std::vector<size_t>(all.begin() + p * a.max_carriers,
+							       all.begin() + std::min(all.size(), (p + 1) * a.max_carriers)) });
+	}
+
+	// Decode the candidates of one dwell for `seconds`, with each VFO moved by
+	// the receiver error of ppm. The result has one entry for each candidate.
+	struct Heard {
+		size_t chan = 0;
+		bool locked = false;
+		uint32_t main_hz = 0;
+		std::vector<double> errors;  // Hz that is left after the ppm correction
+	};
+	auto decode = [&](const Dwell& dw, double seconds, double ppm) {
+		const std::vector<size_t>& cand = dw.cand;
+		std::vector<Heard> heard(cand.size());
+		if (radio_set_center(radio, (uint32_t)dw.center) != RadioErr::ok) {
+			fprintf(stderr, "tetra-analyze: %s\n", radio_error(RadioErr::bad_tune));
 			status = 2;
-			break;
+			return heard;
 		}
 		std::vector<Probe> probes(cand.size());
 		int saved2 = quiet_begin();
+		bank.clear_use();
 		for (size_t i = 0; i < cand.size(); i++) {
+			double hz = chans[cand[i]].hz;
+			heard[i].chan = cand[i];
 			probes[i].chan = cand[i];
 			probe_init(probes[i], chans[cand[i]].hz);
-			probes[i].vfo.init(nullptr, rate, VFO_RATE, VFO_BW,
-					   (double)chans[cand[i]].hz + a.tune_offset - decode_center);
+			double rest;
+			probes[i].band = bank.channel_of(hz + a.tune_offset + ppm * hz / 1e6 - dw.center, &rest);
+			bank.use(probes[i].band);
+			probes[i].vfo.init(nullptr, bank.out_rate(), VFO_RATE, VFO_BW, rest);
 		}
 		quiet_end(saved2);
-		for (size_t k : cand) chans[k].tested = true;
-		int dwell_blocks = std::max(1, (int)llround(a.dwell * 10));
-		// One list of estimates for each candidate, keyed by channel.
-		std::map<size_t, std::vector<double>> errors;
+		int dwell_blocks = std::max(1, (int)llround(seconds * rate / block));
 		for (int b2 = 0; b2 < dwell_blocks; b2++) {
-			int got = rtl_read(rtl, raw.data(), (int)raw.size());
-			if (got <= 0) {
-				fprintf(stderr, "tetra-sniff: the RTL-SDR stopped\n");
+			int cnt = read_live(radio, in, block);
+			if (cnt < 0) {
+				fprintf(stderr, "tetra-analyze: the receiver stopped\n");
 				status = 2;
 				break;
 			}
-			int cnt = got / 2;
-			cu8_to_cf32(raw.data(), cnt, in);
-			for (Probe& p : probes) {
-				int m = p.vfo.process(cnt, in, out);
+			// The decoder fills static tables the first time, so the
+			// probes stay on one thread. The bank uses its workers.
+			int sub = bank.process(cnt, in);
+			for (size_t i = 0; i < probes.size(); i++) {
+				Probe& p = probes[i];
+				int m = p.vfo.process(sub, bank.out(p.band), out);
 				m = p.chain.process(m, out, syms, dibits, bits);
 				for (int off = 0; off < m; off += 2048)
 					tetra_burst_sync_in(p.trs, bits + off, std::min(2048, m - off));
 				// Lock comes and goes, so one moment of it is enough.
 				if (p.trs->state != RX_S_LOCKED) continue;
-				chans[p.chan].locked = true;
+				heard[i].locked = true;
 				// Only while locked does the FLL hold a real estimate of
 				// the error, and only then is this carrier certainly TETRA.
-				errors[p.chan].push_back(p.chain.error_hz());
+				heard[i].errors.push_back(p.chain.error_hz());
 			}
 		}
-		for (Probe& p : probes) {
+		for (size_t i = 0; i < probes.size(); i++) {
 			// System information names the main carrier of the cell, which
 			// is not always the carrier that carries it.
-			chans[p.chan].main_hz = p.tms->last_logged_dl;
-			chans[p.chan].error_n = (int)errors[p.chan].size();
-			chans[p.chan].error_sum = median_of(errors[p.chan]);
-			probe_free(p);
+			heard[i].main_hz = probes[i].tms->last_logged_dl;
+			probe_free(probes[i]);
+		}
+		return heard;
+	};
+
+	// A receiver far off frequency cuts the edge of each carrier in the VFO
+	// filter, and then the system information fails its CRC. A Pluto was
+	// 9.7 ppm off, which is 4 kHz at 420 MHz. So a short first dwell measures
+	// the error, on the dwell with the most candidates, where a network is
+	// most likely. Every dwell after it corrects by that much.
+	double cal_ppm = 0;
+	if (!dwells.empty()) {
+		size_t best = 0;
+		for (size_t di = 1; di < dwells.size(); di++)
+			if (dwells[di].cand.size() > dwells[best].cand.size()) best = di;
+		printf("tetra-analyze: calibrate on %zu candidate(s) at %.3f MHz for %.0f s\n",
+		       dwells[best].cand.size(), dwells[best].center / 1e6, CAL_SECONDS);
+		std::vector<double> ppms;
+		for (const Heard& h : decode(dwells[best], CAL_SECONDS, 0))
+			if (!h.errors.empty())
+				ppms.push_back(median_of(h.errors) / (chans[h.chan].hz / 1e6));
+		if (!ppms.empty()) {
+			cal_ppm = median_of(ppms);
+			printf("tetra-analyze: the receiver is off by about %+.2f ppm, and each dwell"
+			       " corrects that\n", cal_ppm);
+		} else if (!status) {
+			printf("tetra-analyze: no candidate held lock, so the dwells run uncorrected\n");
+		}
+	}
+
+	// Stage 2: decode the candidates of each dwell in turn.
+	for (size_t di = 0; di < dwells.size() && !status; di++) {
+		const Dwell& dw = dwells[di];
+		if (dw.parts > 1)
+			printf("tetra-analyze: span %zu of %zu, part %zu of %zu, decode %zu candidate(s) at"
+			       " %.3f MHz for %.0f s\n", dw.span + 1, groups.size(), dw.part + 1, dw.parts,
+			       dw.cand.size(), dw.center / 1e6, a.dwell);
+		else
+			printf("tetra-analyze: span %zu of %zu, decode %zu candidate(s) at %.3f MHz for %.0f s\n",
+			       dw.span + 1, groups.size(), dw.cand.size(), dw.center / 1e6, a.dwell);
+		for (size_t k : dw.cand) chans[k].tested = true;
+		for (const Heard& h : decode(dw, a.dwell, cal_ppm)) {
+			Channel& c = chans[h.chan];
+			if (h.locked) c.locked = true;
+			c.main_hz = h.main_hz;
+			c.error_n = (int)h.errors.size();
+			// The error as if the VFO had not moved, so that the report and
+			// the run lines stay in the terms of --tune-offset.
+			c.error_sum = h.errors.empty() ? 0 : median_of(h.errors) + cal_ppm * c.hz / 1e6;
 		}
 	}
 
 	dsp::buffer::free(in);
 	dsp::buffer::free(out);
+	for (int w = 1; w < nw; w++) dsp::buffer::free(outw[w]);
 	dsp::buffer::free(syms);
 	dsp::buffer::free(dibits);
 	dsp::buffer::free(bits);
-	rtl_close(rtl);
+	radio_close(radio);
 	if (status) return status;
 
 	// The report.
@@ -498,8 +660,9 @@ int sweep_main(const SweepArgs& a)
 	std::vector<uint32_t> orphans;
 	// A group must be placed against the whole of itself, not against the
 	// carrier that opened it, so take the extremes each time.
+	// A run grows its pool to fit its carrier list, so only the span limits a
+	// group, and a wide span can take the whole band in one run.
 	auto fits = [&](const Group& g, uint32_t hz) {
-		if (g.hz.size() >= a.max_carriers) return false;
 		double lo = std::min<double>(*std::min_element(g.hz.begin(), g.hz.end()), hz);
 		double hi = std::max<double>(*std::max_element(g.hz.begin(), g.hz.end()), hz);
 		return hi - lo <= 2 * good;
@@ -539,21 +702,41 @@ int sweep_main(const SweepArgs& a)
 		       "at once needs one receiver for each, named with --device.\n",
 		       rate / 1e6, runs.size());
 
+	// A run line lists the control carriers, because every grant arrives on
+	// one. A free slot of the pool takes each traffic carrier when a grant
+	// first names it. A carrier whose cell the sweep could not read can be a
+	// control carrier, so it is listed too. The traffic carriers still set the
+	// centre and the width of the span, so that their grants land inside it.
+	auto listed = [&](uint32_t hz) {
+		for (size_t k : found)
+			if (chans[k].hz == hz) return chans[k].main_hz == 0 || chans[k].main_hz == hz;
+		return true;
+	};
 	for (size_t i = 0; i < runs.size(); i++) {
 		Group& g = runs[i];
 		std::sort(g.hz.begin(), g.hz.end());
 		double center = std::round((((double)g.hz.front() + g.hz.back()) / 2) / 10000) * 10000;
+		std::vector<uint32_t> list;
+		for (uint32_t hz : g.hz)
+			if (listed(hz)) list.push_back(hz);
 		if (runs.size() > 1)
-			printf("\n  # span %zu of %zu, %zu carrier(s), %zu control\n", i + 1,
-			       runs.size(), g.hz.size(), g.controls);
-		printf("\n  ./tetra-sniff run --center %.0f \\\n", center);
+			printf("\n  # span %zu of %zu, %zu carrier(s), %zu control, %zu listed\n", i + 1,
+			       runs.size(), g.hz.size(), g.controls, list.size());
+		printf("\n  ./tetra-analyze run --center %.0f \\\n", center);
 		// The rate is what the receiver was measured to take, and the carriers
 		// were grouped into spans that wide. A run at any other rate has a
 		// different span, so the group it is handed may no longer fit.
 		printf("      --rate %.0f \\\n", rate);
+		if (a.rx) printf("      --rx %d \\\n", a.rx);
+		if (a.antenna && *a.antenna) printf("      --antenna %s \\\n", a.antenna);
+		if (a.device_args && *a.device_args) printf("      --device-args %s \\\n", a.device_args);
+		// A receiver with no AGC needs the gain that found these carriers.
+		if (a.gain_db >= 0) printf("      --gain %g \\\n", a.gain_db);
 		if (!ppm.empty()) printf("      --tune-offset %ld \\\n", offset_at(center));
+		// The pool needs a slot for every carrier that the sweep found here.
+		if (g.hz.size() > DEFAULT_MAX_CARRIERS) printf("      --max-carriers %zu \\\n", g.hz.size());
 		printf("      --carriers ");
-		for (size_t j = 0; j < g.hz.size(); j++) printf("%s%u", j ? "," : "", g.hz[j]);
+		for (size_t j = 0; j < list.size(); j++) printf("%s%u", j ? "," : "", list[j]);
 		printf("\n");
 	}
 	printf("\n");
@@ -566,8 +749,10 @@ int sweep_main(const SweepArgs& a)
 		       "not find. Widen --band or raise --dwell to look for it.\n\n");
 	}
 
-	printf("A power scan sees a carrier only while it transmits, so an idle traffic\n"
-	       "carrier is missing from that list. \"run\" reports each grant that names a\n"
-	       "carrier the list does not hold, so watch its log and add what it names.\n");
+	printf("Each run line lists the control carriers, and any carrier whose cell the\n"
+	       "sweep could not read. \"run\" gives a free slot to each traffic carrier when\n"
+	       "a control carrier first grants a call on it, and it keeps what it learns for\n"
+	       "the next start. An idle traffic carrier sends nothing, so the sweep does not\n"
+	       "count it. If \"run\" logs NOSLOT, raise --max-carriers.\n");
 	return 0;
 }

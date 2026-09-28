@@ -9,7 +9,9 @@
 #include <unistd.h>
 
 // A TETRA network keeps every carrier inside a few MHz of the others. A grant
-// beyond this is a decode error, not a carrier that a wider span would reach.
+// this far from the carrier that sent it is a decode error, not a carrier
+// that a wider span would reach. The carrier is the reference and the centre
+// of the span is not: a wide span can put its centre between two networks.
 static const double PLAUSIBLE_BAND_HZ = 10e6;
 
 static void write_all(int fd, const void* p, size_t n, off_t off = -1)
@@ -81,7 +83,7 @@ Recorder::Recorder(uint32_t hz, const std::string& dir, const std::string& start
 	wav.open(base + ".wav");
 	log = fopen((base + ".log").c_str(), "w");
 	if (!log) throw std::runtime_error(base + ".log: " + strerror(errno));
-	fprintf(log, "# tetra-sniff hz=%u start_utc=%s iq_rate=%.0f wav=%u.wav\n", hz, start_utc_iso.c_str(), iq_rate, hz);
+	fprintf(log, "# tetra-analyze hz=%u start_utc=%s iq_rate=%.0f wav=%u.wav\n", hz, start_utc_iso.c_str(), iq_rate, hz);
 	fprintf(log, "# offset_s ISSI GSSI event hz TN usage_marker encr dl_usage chanalloc_hz chanalloc_tn iq_s\n");
 	fflush(log);
 }
@@ -184,7 +186,7 @@ void Recorder::on_event(const tetra_mac_event& ev)
 			double off = std::fabs((double)ev.alloc_hz - span_center_hz);
 			const char* status;
 			const char* note;
-			if (off >= PLAUSIBLE_BAND_HZ) {
+			if (std::fabs((double)ev.alloc_hz - (double)hz) >= PLAUSIBLE_BAND_HZ) {
 				// Nothing reaches this, and no wider span would, so it must
 				// not read as advice to move the centre.
 				status = "BADFREQ";
