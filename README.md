@@ -81,62 +81,6 @@ its four cores, at 92 MB for the whole tree. With a LimeSDR-USB at 61.44 MS/s
 and 30 carriers, the tree took about 2.9 of the four cores, 2.2 of them in
 the parent, and `clock.log` stayed clean.
 
-### Packages
-
-`./build.sh` installs the compiler tools, cmake, volk, SoapySDR, FFTW, and every
-hardware Soapy module this OS lists (`soapysdr-module-*` on apt, `soapy*`
-plus `limesuite` on Homebrew). It skips the kitchen-sink `-all` package and
-the remote/audio/osmosdr wrappers, which conflict or are not a stick. On
-Debian it installs the host packages without Recommends, because
-`libsoapysdr0.8` recommends that `-all` package. It adds `ca-certificates`
-for HTTPS and `soapysdr-tools` for `SoapySDRUtil`.
-
-`SKIP_DEPS=1 ./build.sh` leaves the host packages as they are.
-`SOAPY_SKIP_MODULES=1 ./build.sh` leaves the device plugins as they are.
-
-What the two reference hosts typically ship:
-
-| Receiver | Debian | Homebrew |
-| --- | --- | --- |
-| RTL-SDR | `soapysdr-module-rtlsdr` | `soapyrtlsdr` |
-| HackRF | `soapysdr-module-hackrf` | `soapyhackrf` |
-| Airspy | `soapysdr-module-airspy` | not in brew-core |
-| bladeRF | `soapysdr-module-bladerf` | not in brew-core |
-| LimeSDR | `soapysdr-module-lms7` | `limesuite` |
-| USRP | `soapysdr-module-uhd`, and `uhd-host` for the images | `uhd`; SoapyUHD is not in brew-core |
-| Pluto | not in Debian 13 (sid has `soapysdr-module-plutosdr`); build SoapyPlutoSDR | not in brew-core |
-| SDRplay | not packaged: the SDRplay API, then SoapySDRPlay3 | not in brew-core |
-
-A USRP also needs the firmware and FPGA images of UHD. On Debian 13 the
-downloader puts them where libuhd does not look, so name the directory:
-
-```
-sudo uhd_images_downloader -t b2xx -i /usr/share/uhd/images
-```
-
-At a wide rate a USRP also needs a larger receive buffer. UHD's default
-buffer overflows at 61.44 MS/s while the program works on a block. Give
-`--device-args num_recv_frames=1024` to `sweep`, and the run lines it prints
-carry it. Linux limits USB buffers to 16 MB (`usbfs_memory_mb`), so 1024
-frames is the largest that opens.
-
-A bladeRF needs three things on Debian 13. Its udev rules grant access only
-to a local desktop session (`uaccess`), so SSH logins and services need a
-rule of their own, for example `GROUP="plugdev"`. A bladeRF 1 needs its FPGA
-image (`bladerf-fpga-hostedx40` or `bladerf-fpga-hostedx115`), and that image
-needs firmware 2.4.0 or later (`bladerf-firmware-fx3`, then `bladeRF-cli -f`).
-Firmware 2.x changes its USB ID from `1d50:6066` to `2cf0:5246`. With all of
-that, a bladeRF x115 still overflowed on almost every buffer through
-SoapyBladeRF 0.4.2, while `bladeRF-cli` streamed without a fault.
-
-When USB shows a known receiver that Soapy does not list, the program says
-whether its Soapy module is missing or loaded, and what to do next.
-
-A LimeSDR has more than one RX input, and each has its own connector. The
-program uses LNAW (RX1_W on a LimeSDR-USB) unless `--antenna` names another.
-A LimeSDR-USB with its antenna on RX1_L needs `--antenna LNAL`. An input with
-no antenna shows only the DC spike at the centre of the span. A LimeSDR has no
-automatic gain, so "auto" keeps the gain of the driver, 32 dB.
 
 ### Active TETRA network in range
 `sweep` runs a scan for active control carriers across the TETRA spectrum, and the traffic carriers are then learned from the grants that the
@@ -189,66 +133,7 @@ nohup ./tetra-analyze run --carriers 419162500,419562500 \
 ### Finding carriers
 
 `sweep` measures every channel of the raster, then puts a demodulator on
-each peak. It prints a ready `run` command line. The messages of the Soapy
-driver are left out here:
-
-```
-$ ./tetra-analyze sweep
-Found Rafael Micro R828D tuner
-RTL-SDR Blog V4 Detected
-tetra-analyze: the receiver takes 3.200 MS/s, so a span is 3.170 MHz
-tetra-analyze: sweep 380.000-430.000 MHz, 12.5 kHz raster, 3.2 MS/s, 17 span(s), rx 0 RX
-tetra-analyze: span 1 at 381.585 MHz, 254 channels
-tetra-analyze: span 2 at 384.596 MHz, 241 channels
-[...]
-tetra-analyze: 106 peak(s) at or above 6.0 dB over the noise floor
-tetra-analyze: 14 span(s) to decode
-tetra-analyze: calibrate on 14 candidate(s) at 420.680 MHz for 3 s
-tetra-analyze: the receiver is off by about +0.08 ppm, and each dwell corrects that
-tetra-analyze: span 1 of 14, decode 4 candidate(s) at 382.230 MHz for 15 s
-[...]
-tetra-analyze: span 14 of 14, decode 7 candidate(s) at 429.040 MHz for 15 s
-
-  channel       SNR dB  role                     cell main carrier  error Hz
-  390012500        8.1  TETRA traffic carrier    391037500          -497
-  390512500       23.9  TETRA control carrier    390512500          -292
-  390862500       23.1  TETRA traffic carrier    390512500          -257
-  [...]
-
-24 TETRA carrier(s), of which 8 are a control carrier.
-
-The receiver is off by about -0.75 ppm, from 13 carrier(s) above the noise that
-held lock, spread -3.95 to +0.96 ppm. Each run below carries the
-offset in Hz at its own centre, because the error scales with it.
-That spread is wide for one oscillator. A carrier of its own may
-sit off frequency, or a weak one may not have settled. A longer
---dwell tightens it.
-
-Those carriers do not fit one span at 3.2 MS/s, so they need 3 runs,
-one for each span. A receiver hears one span at a time, so running them
-at once needs one receiver for each, named with --device.
-
-  # span 1 of 3, 6 carrier(s), 3 control, 3 listed
-
-  ./tetra-analyze run --center 390890000 \
-      --rate 3200000 \
-      --tune-offset -292 \
-      --carriers 390512500,391037500,391562500
-
-  # span 2 of 3, 9 carrier(s), 3 control, 3 listed
-[...]
-
-3 carrier(s) sit too far from any control carrier to share a span with
-one, so nothing would grant them: 393237500 393287500 419550000
-They are traffic carriers of a cell whose control carrier the sweep did
-not find. Widen --band or raise --dwell to look for it.
-
-Each run line lists the control carriers, and any carrier whose cell the
-sweep could not read. "run" gives a free slot to each traffic carrier when
-a control carrier first grants a call on it, and it keeps what it learns for
-the next start. An idle traffic carrier sends nothing, so the sweep does not
-count it. If "run" logs NOSLOT, raise --max-carriers.
-```
+each peak. It prints a ready `run` command line.
 
 With no `--rate`, the sweep asks for the widest rate that holds the whole
 band (or a narrower `--band`) in one span, up to what the receiver takes.
@@ -349,7 +234,7 @@ src/timemap.py RUNDIR utc 1001 2026-09-12T15:20:00Z   # UTC -> byte offset
 
 ### UI
 
-`src/ui.py` serves one page that shows what a run is doing: health, the
+`src/ui.py` serves one page that shows what the current/latest run is doing: health, the
 band it covers, every talkgroup it has recorded with its audio, the carriers
 it follows, and every call it could not take.
 
