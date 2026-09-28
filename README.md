@@ -103,6 +103,15 @@ buffer overflows at 61.44 MS/s while the program works on a block. Give
 carry it. Linux limits USB buffers to 16 MB (`usbfs_memory_mb`), so 1024
 frames is the largest that opens.
 
+A bladeRF needs three things on Debian 13. Its udev rules grant access only
+to a local desktop session (`uaccess`), so SSH logins and services need a
+rule of their own, for example `GROUP="plugdev"`. A bladeRF 1 needs its FPGA
+image (`bladerf-fpga-hostedx40` or `bladerf-fpga-hostedx115`), and that image
+needs firmware 2.4.0 or later (`bladerf-firmware-fx3`, then `bladeRF-cli -f`).
+Firmware 2.x changes its USB ID from `1d50:6066` to `2cf0:5246`. With all of
+that, a bladeRF x115 still overflowed on almost every buffer through
+SoapyBladeRF 0.4.2, while `bladeRF-cli` streamed without a fault.
+
 When USB shows a known receiver that Soapy does not list, the program says
 whether its Soapy module is missing or loaded, and what to do next.
 
