@@ -39,9 +39,6 @@ static const double DEFAULT_TUNE_OFFSET = 0;
 static const double DEFAULT_RATE = 3200000;
 static const char* DEFAULT_OUT = "recordings";
 static const size_t DEFAULT_MAX_GSSI = 256;
-// The pool of carrier slots. The measured cost is about 1.6% of one core in
-// the channelizer of the parent for each one, plus about 1.5% in its child.
-static const size_t DEFAULT_MAX_CARRIERS = 15;
 // One health line every five minutes. A month of running is then 8640 lines.
 static const double DEFAULT_STATUS = 300;
 static const size_t DEFAULT_QUEUE_BLOCKS = 400;

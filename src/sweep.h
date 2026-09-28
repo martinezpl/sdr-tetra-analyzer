@@ -13,6 +13,11 @@ static const double TETRA_SPAN_HZ = TETRA_BAND_HI - TETRA_BAND_LO;
 static const double SWEEP_EDGE_HZ = 15000;
 static const double SWEEP_ONE_SPAN_MARGIN = 1.25;
 
+// The pool of carrier slots. The measured cost is about 1.6% of one core in
+// the channelizer of the parent for each one, plus about 1.5% in its child.
+// "sweep" prints run lines against this default.
+static const size_t DEFAULT_MAX_CARRIERS = 15;
+
 struct SweepArgs {
 	double band_lo, band_hi;   // the band to search, in Hz
 	double rate;               // dongle sample rate, and so the width of one span

@@ -702,13 +702,26 @@ int sweep_main(const SweepArgs& a)
 		       "at once needs one receiver for each, named with --device.\n",
 		       rate / 1e6, runs.size());
 
+	// A run line lists the control carriers, because every grant arrives on
+	// one. A free slot of the pool takes each traffic carrier when a grant
+	// first names it. A carrier whose cell the sweep could not read can be a
+	// control carrier, so it is listed too. The traffic carriers still set the
+	// centre and the width of the span, so that their grants land inside it.
+	auto listed = [&](uint32_t hz) {
+		for (size_t k : found)
+			if (chans[k].hz == hz) return chans[k].main_hz == 0 || chans[k].main_hz == hz;
+		return true;
+	};
 	for (size_t i = 0; i < runs.size(); i++) {
 		Group& g = runs[i];
 		std::sort(g.hz.begin(), g.hz.end());
 		double center = std::round((((double)g.hz.front() + g.hz.back()) / 2) / 10000) * 10000;
+		std::vector<uint32_t> list;
+		for (uint32_t hz : g.hz)
+			if (listed(hz)) list.push_back(hz);
 		if (runs.size() > 1)
-			printf("\n  # span %zu of %zu, %zu carrier(s), %zu control\n", i + 1,
-			       runs.size(), g.hz.size(), g.controls);
+			printf("\n  # span %zu of %zu, %zu carrier(s), %zu control, %zu listed\n", i + 1,
+			       runs.size(), g.hz.size(), g.controls, list.size());
 		printf("\n  ./tetra-analyze run --center %.0f \\\n", center);
 		// The rate is what the receiver was measured to take, and the carriers
 		// were grouped into spans that wide. A run at any other rate has a
@@ -720,8 +733,10 @@ int sweep_main(const SweepArgs& a)
 		// A receiver with no AGC needs the gain that found these carriers.
 		if (a.gain_db >= 0) printf("      --gain %g \\\n", a.gain_db);
 		if (!ppm.empty()) printf("      --tune-offset %ld \\\n", offset_at(center));
+		// The pool needs a slot for every carrier that the sweep found here.
+		if (g.hz.size() > DEFAULT_MAX_CARRIERS) printf("      --max-carriers %zu \\\n", g.hz.size());
 		printf("      --carriers ");
-		for (size_t j = 0; j < g.hz.size(); j++) printf("%s%u", j ? "," : "", g.hz[j]);
+		for (size_t j = 0; j < list.size(); j++) printf("%s%u", j ? "," : "", list[j]);
 		printf("\n");
 	}
 	printf("\n");
@@ -734,8 +749,10 @@ int sweep_main(const SweepArgs& a)
 		       "not find. Widen --band or raise --dwell to look for it.\n\n");
 	}
 
-	printf("A power scan sees a carrier only while it transmits, so an idle traffic\n"
-	       "carrier is missing from that list. \"run\" reports each grant that names a\n"
-	       "carrier the list does not hold, so watch its log and add what it names.\n");
+	printf("Each run line lists the control carriers, and any carrier whose cell the\n"
+	       "sweep could not read. \"run\" gives a free slot to each traffic carrier when\n"
+	       "a control carrier first grants a call on it, and it keeps what it learns for\n"
+	       "the next start. An idle traffic carrier sends nothing, so the sweep does not\n"
+	       "count it. If \"run\" logs NOSLOT, raise --max-carriers.\n");
 	return 0;
 }
