@@ -271,11 +271,11 @@ def scan(out):
 
     # The pool, as the run was given it and as grants filled it.
     followed = sorted(int(h) for h in carriers)
-    # DIR/carriers holds every carrier a slot follows. A line marked "learned"
+    # RUN/carriers holds every carrier a slot follows. A line marked "learned"
     # is one that a grant revealed; the rest came from the command line.
     pool, learned = [], []
     try:
-        with open(os.path.join(out, "carriers")) as f:
+        with open(os.path.join(run, "carriers")) as f:
             for line in f:
                 if line.startswith("#") or not line.strip():
                     continue

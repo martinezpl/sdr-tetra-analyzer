@@ -46,14 +46,13 @@ releases, and a carrier outside the captured span decodes nothing. The
 example below matches the capture in step 1.
 
 Pin everything else that can vary. `--start-utc` fixes the run directory
-name, `--max-carriers` equal to the carrier count leaves no free slot, and
-`--no-learn` stops the carrier file from changing what the next run does:
+name, and `--max-carriers` equal to the carrier count leaves no free slot:
 
 ```
 ./tetra-analyze run --iq ~/golden.cu8 --fmt cu8 --rate 3200000 \
     --center 420000000 --tune-offset -2500 \
     --start-utc 2026-01-01T00:00:00Z \
-    --max-carriers 13 --no-learn \
+    --max-carriers 13 \
     --out /tmp/base \
     418562500 418762500 418962500 419162500 419362500 419562500 419762500 \
     419962500 420162500 420362500 420562500 420762500 420962500
