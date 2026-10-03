@@ -165,8 +165,7 @@ The run lines that `sweep` prints list only the control carriers, and any
 carrier whose cell it could not read. The traffic carriers that it found still
 set the centre of each span, so their grants land inside it, and a span with
 more carriers than the pool default (15) gets `--max-carriers` for all of
-them. So only the first call on each traffic carrier loses its head, because
-`run` keeps the carriers it learns in `DIR/carriers`.
+them. So only the first call on each traffic carrier in a run loses its head.
 
 `sweep` tells the two apart: a carrier whose system information names itself
 as the main carrier of its cell is a control carrier.
@@ -185,9 +184,10 @@ So a sweep only has to find the control carriers. The rest fills itself:
 tetra-analyze: slot 5 takes 420362500 Hz, granted to GSSI 1002 by 419562500 Hz
 ```
 
-The learned carriers go to `DIR/carriers` beside the recordings, and the next
-run reads them back, so a restart at the UTC day boundary does not learn them
-all over again. `--no-learn` turns that file off.
+Each run starts with only the `--carriers` list in the pool, so it finds the
+traffic carriers again. A carrier that the network no longer uses does not
+keep a slot. The carriers that the slots follow go to `carriers` in the run
+directory, for the web overview. No run reads that file back.
 
 ### Core options
 
@@ -216,6 +216,7 @@ Each run makes one directory, `recordings/<start_utc>/`:
 | `calls.log` | One line for each decoded voice frame, and one for each call that could not be recorded |
 | `timemap.log` | Anchors that tie a position in a WAV to a capture sample |
 | `clock.log` | UTC against the sample counter, one line each second |
+| `carriers` | The carriers that the slots follow. `learned` marks one that a grant found |
 
 `clock.log` is the health record of a run. Its `dropped` column counts the
 overflows that the driver of the receiver reported. It must stay at zero;

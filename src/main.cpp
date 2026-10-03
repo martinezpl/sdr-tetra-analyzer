@@ -147,9 +147,8 @@ static const char* USAGE =
 	"                     taken back, because a retune costs the head of a call\n"
 	"                     and a carrier that the network used once it uses again.\n"
 	"                     Each slot costs about 1.6% of one core. Default 15.\n"
-	"  --no-learn         Do not read or write DIR/carriers. That file remembers\n"
-	"                     the carriers that a grant revealed, so a restart keeps\n"
-	"                     them instead of learning them again.\n"
+	"                     Each run starts with an empty pool, apart from\n"
+	"                     --carriers.\n"
 	"\n"
 	"replay options (no receiver):\n"
 	"  --iq FILE          Read IQ samples from FILE. \"-\" means stdin. An SDR++\n"
@@ -224,7 +223,6 @@ struct Args {
 	bool per_carrier = false;
 	size_t max_gssi = DEFAULT_MAX_GSSI;
 	size_t max_carriers = DEFAULT_MAX_CARRIERS;
-	bool learn = true;
 	size_t queue_blocks = DEFAULT_QUEUE_BLOCKS;
 	double status = DEFAULT_STATUS;
 };
@@ -389,7 +387,6 @@ static Args parse_args(int argc, char** argv)
 		else if (s == "--queue-blocks") a.queue_blocks = parse_count(val(), "--queue-blocks");
 		else if (s == "--status") a.status = parse_double(val(), "--status");
 		else if (s == "--max-carriers") a.max_carriers = parse_count(val(), "--max-carriers");
-		else if (s == "--no-learn") a.learn = false;
 		else if (s.size() > 1 && s[0] == '-' && !isdigit((unsigned char)s[1]))
 			die("unknown option " + s + "\nRun \"tetra-analyze help\" for the options.");
 		else {
@@ -540,34 +537,17 @@ static IqSource open_iq(const Args& a)
 	return s;
 }
 
-// The carriers that grants revealed, kept beside the recordings. A restart at
-// the UTC day boundary would otherwise forget them and lose the head of the
-// first call on each one all over again.
-static std::vector<uint32_t> read_learned(const std::string& path)
-{
-	std::vector<uint32_t> hz;
-	FILE* f = fopen(path.c_str(), "r");
-	if (!f) return hz;
-	char line[64];
-	while (fgets(line, sizeof line, f)) {
-		if (line[0] == '#') continue;
-		unsigned long v = strtoul(line, nullptr, 10);
-		if (v && v <= 0xffffffffUL) hz.push_back((uint32_t)v);
-	}
-	fclose(f);
-	return hz;
-}
-
+// The carriers that the slots follow, for the web overview. The next run does
+// not read it, so each run finds its carriers again.
 static void write_learned(const std::string& path, const Allocations& alloc,
 			  const std::set<uint32_t>& learned)
 {
 	std::string tmp = path + ".tmp";
 	FILE* f = fopen(tmp.c_str(), "w");
 	if (!f) return;
-	fprintf(f, "# tetra-analyze remembers the carriers that a grant revealed.\n"
-		   "# Delete this file to forget them. --no-learn stops it being written.\n");
+	fprintf(f, "# The carriers that the slots of this run follow.\n");
 	// A grant revealed the ones marked "learned". The rest came from the command
-	// line. strtoul stops at the space, so an older reader still parses this.
+	// line.
 	for (size_t i = 0; i < alloc.slots(); i++)
 		if (uint32_t hz = alloc.assigned(i))
 			fprintf(f, "%u%s\n", hz, learned.count(hz) ? " learned" : "");
@@ -721,43 +701,18 @@ int main(int argc, char** argv)
 	// The carrier list seeds the pool. A free slot waits for a control carrier
 	// to grant a clear call on a carrier that no slot follows. This must settle
 	// before the shared table is sized, because the table cannot grow later.
-	std::string learn_path = a.out + "/carriers";
-	std::string learned_note;
-	if (a.learn && !a.per_carrier) {
-		size_t before = a.hz.size();
-		size_t unreachable = 0;
-		for (uint32_t hz : read_learned(learn_path)) {
-			if (std::find(a.hz.begin(), a.hz.end(), hz) != a.hz.end() ||
-			    a.hz.size() >= a.max_carriers)
-				continue;
-			// --center or --rate can have moved since that carrier was learned.
-			// A command line carrier outside the span is a mistake and stops the
-			// run; a remembered one is stale, so drop it and say so.
-			if (std::fabs((double)hz + a.tune_offset - src.center) + 15e3 >= src.rate / 2) {
-				unreachable++;
-				continue;
-			}
-			a.hz.push_back(hz);
-		}
-		if (a.hz.size() > before)
-			learned_note = "tetra-analyze: " + std::to_string(a.hz.size() - before) +
-				       " carrier(s) remembered from " + learn_path + "\n";
-		if (unreachable)
-			learned_note += "tetra-analyze: " + std::to_string(unreachable) +
-					" remembered carrier(s) fall outside this span and were"
-					" dropped\n";
-	}
+	std::string pool_note;
 	size_t pool = a.max_carriers;
 	if (a.per_carrier) {
 		// A per-carrier WAV is named for its frequency, so a slot that moves
 		// would have to rotate its files. Keep the list fixed instead.
 		if (pool != a.hz.size())
-			learned_note += "tetra-analyze: --per-carrier keeps the carrier list fixed,"
+			pool_note += "tetra-analyze: --per-carrier keeps the carrier list fixed,"
 					" so there are no free slots\n";
 		pool = a.hz.size();
 	}
 	if (pool < a.hz.size()) {
-		learned_note += "tetra-analyze: --max-carriers " + std::to_string(a.max_carriers) +
+		pool_note += "tetra-analyze: --max-carriers " + std::to_string(a.max_carriers) +
 				" is below the " + std::to_string(a.hz.size()) +
 				" carriers given, so the pool grows to fit them\n";
 		pool = a.hz.size();
@@ -774,7 +729,7 @@ int main(int argc, char** argv)
 			line += (i ? "," : "") + std::to_string(a.hz[i]);
 		line += a.per_carrier ? " (per-carrier files on)\n" : "\n";
 		std::cout << line;
-		std::cout << learned_note;
+		std::cout << pool_note;
 		if (pool > a.hz.size())
 			std::cout << "tetra-analyze: " + std::to_string(pool - a.hz.size()) +
 					 " free carrier slot(s) for carriers that a grant names\n";
@@ -900,6 +855,8 @@ int main(int argc, char** argv)
 			  "# utc vfo_sample queue dropped event\n",
 		run_dir.c_str(), start_iso.c_str(), src.rate, VFO_RATE, src.center);
 	log_previous_run(clock_fd, a.out, run_dir);
+	std::string pool_path = run_dir + "/carriers";
+	write_learned(pool_path, allocations, {});
 	sd_notify("READY=1");
 	// Which carriers a grant revealed, as against those the command line gave.
 	std::set<uint32_t> learned_hz;
@@ -972,8 +929,7 @@ int main(int argc, char** argv)
 					 std::to_string(d.ssi) + " by " + std::to_string(d.control_hz) +
 					 " Hz\n";
 			learned_hz.insert(d.hz);
-			if (a.learn && !a.per_carrier)
-				write_learned(learn_path, allocations, learned_hz);
+			write_learned(pool_path, allocations, learned_hz);
 		}
 		clock_tick(clock_fd, vfo_samples, queue, dropped);
 	}

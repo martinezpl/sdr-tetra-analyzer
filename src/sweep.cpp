@@ -751,8 +751,8 @@ int sweep_main(const SweepArgs& a)
 
 	printf("Each run line lists the control carriers, and any carrier whose cell the\n"
 	       "sweep could not read. \"run\" gives a free slot to each traffic carrier when\n"
-	       "a control carrier first grants a call on it, and it keeps what it learns for\n"
-	       "the next start. An idle traffic carrier sends nothing, so the sweep does not\n"
-	       "count it. If \"run\" logs NOSLOT, raise --max-carriers.\n");
+	       "a control carrier first grants a call on it. An idle traffic carrier sends\n"
+	       "nothing, so the sweep does not count it. If \"run\" logs NOSLOT, raise\n"
+	       "--max-carriers.\n");
 	return 0;
 }
