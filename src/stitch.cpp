@@ -62,7 +62,7 @@ static void conceal(int16_t* pcm)
 	}
 }
 
-struct CallState {
+struct WorkerState {
 	WavWriter wav;
 	int log_fd;
 	int map_fd;
@@ -72,7 +72,7 @@ struct CallState {
 	uint64_t previous_sample = 0;
 };
 
-static void emit_frame(CallState& state, const std::vector<VoiceFrame>& copies)
+static void emit_frame(WorkerState& state, const std::vector<VoiceFrame>& copies)
 {
 	const VoiceFrame* frame = &copies.front();
 	for (const auto& copy : copies)
@@ -110,7 +110,7 @@ static void emit_frame(CallState& state, const std::vector<VoiceFrame>& copies)
 	char line[200];
 	int len = snprintf(line, sizeof line, "%llu %u %u %u %u %u %u %u %s\n",
 			   (unsigned long long)frame->sample, frame->frame, frame->issi,
-			   frame->gssi, frame->hz, frame->control_hz, frame->tn, frame->usage,
+			   frame->gssi, frame->hz, frame->control_hz, frame->tn, frame->usage_marker,
 			   good ? "FRAME" : "BAD");
 	write(state.log_fd, line, len);
 	if (event) {
@@ -126,7 +126,7 @@ static void emit_frame(CallState& state, const std::vector<VoiceFrame>& copies)
 	state.previous_sample = frame->sample;
 }
 
-static void emit_bucket(CallState& state, std::vector<VoiceFrame>& frames)
+static void emit_bucket(WorkerState& state, std::vector<VoiceFrame>& frames)
 {
 	if (state.previous_sample && frames.front().sample <= state.previous_sample)
 		return;
@@ -149,9 +149,9 @@ static void emit_bucket(CallState& state, std::vector<VoiceFrame>& frames)
 	}
 }
 
-static int call_main(int fd, const std::string& dir, uint32_t gssi)
+static int talkgroup_main(int fd, const std::string& dir, uint32_t gssi)
 {
-	CallState state;
+	WorkerState state;
 	state.wav.open(dir + "/calls/" + std::to_string(gssi) + ".wav");
 	state.log_fd = open((dir + "/calls.log").c_str(), O_WRONLY | O_APPEND);
 	if (state.log_fd < 0) throw std::runtime_error(strerror(errno));
@@ -199,7 +199,7 @@ int stitch_main(int fd, const std::string& dir, size_t max_gssi)
 	int log_fd = open((dir + "/calls.log").c_str(), O_CREAT | O_APPEND | O_WRONLY, 0644);
 	if (log_fd < 0) throw std::runtime_error(strerror(errno));
 	const char* header =
-		"# capture_sample tdma_frame ISSI GSSI carrier_hz control_hz TN usage status\n";
+		"# vfo_sample tdma_frame ISSI GSSI carrier_hz control_hz TN usage_marker status\n";
 	// The header goes only into an empty file. A second run keeps the lines of the first run.
 	if (lseek(log_fd, 0, SEEK_END) == 0)
 		write(log_fd, header, strlen(header));
@@ -207,7 +207,7 @@ int stitch_main(int fd, const std::string& dir, size_t max_gssi)
 
 	int map_fd = open((dir + "/timemap.log").c_str(), O_CREAT | O_APPEND | O_WRONLY, 0644);
 	if (map_fd < 0) throw std::runtime_error(strerror(errno));
-	const char* map_header = "# capture_sample tdma_frame GSSI wav_sample event\n";
+	const char* map_header = "# vfo_sample tdma_frame GSSI wav_sample event\n";
 	// The header goes only into an empty file. A second run keeps the lines of the first run.
 	if (lseek(map_fd, 0, SEEK_END) == 0)
 		write(map_fd, map_header, strlen(map_header));
@@ -227,7 +227,7 @@ int stitch_main(int fd, const std::string& dir, size_t max_gssi)
 			if (workers.size() >= max_gssi) {
 				if (!cap_logged)
 					std::cout << "tetra-analyze: " << max_gssi
-						  << " GSSI workers is the limit. GSSI "
+						  << " talkgroup workers is the limit. GSSI "
 						  << frame.gssi << " gets no worker.\n";
 				cap_logged = true;
 				continue;
@@ -240,7 +240,7 @@ int stitch_main(int fd, const std::string& dir, size_t max_gssi)
 				close(pipe_fd[1]);
 				close(fd);
 				for (const auto& worker : workers) close(worker.second.fd);
-				exit(call_main(pipe_fd[0], dir, frame.gssi));
+				exit(talkgroup_main(pipe_fd[0], dir, frame.gssi));
 			}
 			close(pipe_fd[0]);
 			it = workers.emplace(frame.gssi, Worker{ pid, pipe_fd[1] }).first;
@@ -251,7 +251,7 @@ int stitch_main(int fd, const std::string& dir, size_t max_gssi)
 					 std::to_string(frame.gssi) + ".wav\n";
 		}
 		if (!write_frame(it->second.fd, frame)) {
-			// A dead call worker points to a full disk. The run stops.
+			// A dead talkgroup worker points to a full disk. The run stops.
 			std::cout << "tetra-analyze: GSSI " << frame.gssi << " worker died: " << strerror(errno) << "\n";
 			worst = 5;
 			break;

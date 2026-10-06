@@ -54,7 +54,7 @@ def fields(path):
 
 
 def frames(rundir, gssi):
-    """Every frame of one GSSI, as (wav_start, wav_end, capture_sample).
+    """Every frame of one GSSI, as (wav_start, wav_end, vfo_sample).
 
     An anchor holds the WAV position after its own frame, so the frame always
     occupies the last 480 samples before it. A gap in front of wav_start is a
@@ -63,7 +63,7 @@ def frames(rundir, gssi):
     anchors = {}
     for t in fields(os.path.join(rundir, "timemap.log")):
         if len(t) >= 5 and t[2] == gssi:
-            anchors[(t[0], t[1])] = int(t[3])   # (capture_sample, tdma_frame) -> wav
+            anchors[(t[0], t[1])] = int(t[3])   # (vfo_sample, tdma_frame) -> wav
     out, pos = [], 0
     for t in fields(os.path.join(rundir, "calls.log")):
         if len(t) < 4 or t[3] != gssi:
@@ -135,13 +135,13 @@ def do_wav(rundir, gssi, byte):
     if sample < 0:
         return "byte %d sits inside the 44-byte WAV header" % byte
     rows = clock(rundir)
-    for start, end, capture in frames(rundir, gssi):
+    for start, end, vfo_sample in frames(rundir, gssi):
         if sample < start:
             return "silence before the frame at %s (WAV %.3f s, no calls.log line here)" % (
-                render(sample_to_utc(rows, capture)), sample / RATE)
+                render(sample_to_utc(rows, vfo_sample)), sample / RATE)
         if sample < end:
-            return "%s (WAV %.3f s, capture_sample %d)" % (
-                render(sample_to_utc(rows, capture)), sample / RATE, capture)
+            return "%s (WAV %.3f s, vfo_sample %d)" % (
+                render(sample_to_utc(rows, vfo_sample)), sample / RATE, vfo_sample)
     return "byte %d is past the end of the GSSI %s recording" % (byte, gssi)
 
 
@@ -149,10 +149,10 @@ def do_utc(rundir, gssi, text):
     want = utc_to_sample(clock(rundir), parse_iso(text))
     if want is None:
         return "%s lies outside the span that clock.log covers" % text
-    for start, end, capture in frames(rundir, gssi):
-        if capture >= want:
-            return "byte %d (WAV %.3f s, capture_sample %d)" % (
-                HDR + start * 2, start / RATE, capture)
+    for start, end, vfo_sample in frames(rundir, gssi):
+        if vfo_sample >= want:
+            return "byte %d (WAV %.3f s, vfo_sample %d)" % (
+                HDR + start * 2, start / RATE, vfo_sample)
     return "GSSI %s records nothing at or after %s" % (gssi, text)
 
 
@@ -162,14 +162,14 @@ def selftest():
     # Two calls for GSSI 777. Frame 3 follows a separator, frame 4 follows a
     # 2-frame concealment run. A second GSSI proves the filter works.
     open(os.path.join(d, "calls.log"), "w").write(
-        "# capture_sample tdma_frame ISSI GSSI carrier_hz control_hz TN usage status\n"
+        "# vfo_sample tdma_frame ISSI GSSI carrier_hz control_hz TN usage status\n"
         "36000 1 1 777 418962500 419162500 1 17 FRAME\n"
         "72000 2 1 777 418962500 419162500 1 17 FRAME\n"
         "252000 9 1 777 418962500 419162500 1 17 FRAME\n"
         "288000 12 1 777 418962500 419162500 1 17 FRAME\n"
         "324000 13 1 888 418962500 419162500 1 17 FRAME\n")
     open(os.path.join(d, "timemap.log"), "w").write(
-        "# capture_sample tdma_frame GSSI wav_sample event\n"
+        "# vfo_sample tdma_frame GSSI wav_sample event\n"
         "36000 1 777 480 START\n"
         "252000 9 777 5440 SEP\n"
         "288000 12 777 6880 FILL\n")
@@ -179,7 +179,7 @@ def selftest():
         "2026-09-11T00:00:01.000Z 36000 0 0 OK\n"
         "2026-09-11T00:00:02.000Z 72000 0 0 OK\n"
         "2026-09-11T00:00:03.000Z 108000 0 0 OK\n"
-        "2026-09-11T00:00:04.000Z 108000 0 0 OK\n"    # the dongle delivers nothing
+        "2026-09-11T00:00:04.000Z 108000 0 0 OK\n"    # the receiver delivers nothing
         "2026-09-11T00:00:05.000Z 108000 0 0 OK\n"    # and still nothing
         "2026-09-11T00:00:06.000Z 144000 0 0 OK\n"
         "2026-09-11T00:00:07.000Z 180000 0 0 OK\n"

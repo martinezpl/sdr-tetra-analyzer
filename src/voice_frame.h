@@ -9,7 +9,7 @@ struct VoiceFrame {
 	uint32_t gssi;
 	uint32_t issi;
 	uint8_t tn;
-	uint8_t usage;
+	uint8_t usage_marker;
 	int8_t encr;
 	uint8_t bits[432];
 };

@@ -1,28 +1,27 @@
 #pragma once
 #include <cstddef>
 
-// The TETRA allocation below 470 MHz. A sweep with no --band searches all of
-// it. A sweep with no --rate asks for a window that holds that allocation
-// in one span. The search band does not grow; only the sample window may,
-// so a stick that snaps or lists a coarse rate (Lime 61.44 MS/s) still
-// covers. SWEEP_ONE_SPAN_MARGIN is that extra, 20% plus a little for the
-// next listed rate above 20%.
+// The TETRA band below 470 MHz. A sweep with no --band searches all of it.
+// A sweep with no --rate asks for a rate whose span holds that band. The
+// search band does not grow; only the span can, so a receiver that snaps or
+// lists a coarse rate (Lime 61.44 MS/s) still covers. SWEEP_ONE_SPAN_MARGIN
+// is that extra, 20% plus a little for the next listed rate above 20%.
 static const double TETRA_BAND_LO = 380000000;
 static const double TETRA_BAND_HI = 430000000;
 static const double TETRA_SPAN_HZ = TETRA_BAND_HI - TETRA_BAND_LO;
 static const double SWEEP_EDGE_HZ = 15000;
 static const double SWEEP_ONE_SPAN_MARGIN = 1.25;
 
-// The pool of carrier slots. The measured cost is about 1.6% of one core in
-// the channelizer of the parent for each one, plus about 1.5% in its child.
+// The pool of lanes. The measured cost is about 1.6% of one core in
+// the VFO of the parent for each one, plus about 1.5% in its child.
 // "sweep" prints run lines against this default.
 static const size_t DEFAULT_MAX_CARRIERS = 15;
 
 struct SweepArgs {
 	double band_lo, band_hi;   // the band to search, in Hz
-	double rate;               // dongle sample rate, and so the width of one span
+	double rate;               // receiver sample rate, and so the width of one span
 	double step;               // channel raster of the power scan
-	double tune_offset;        // correction for the frequency error of the dongle
+	double tune_offset;        // correction for the frequency error of the receiver
 	double gain_db;            // below zero means the automatic gain of the tuner
 	int device;
 	double scan;               // seconds of power measurement for each group

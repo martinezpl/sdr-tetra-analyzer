@@ -22,15 +22,15 @@
 #include <unistd.h>
 
 #include <dsp/channel/rx_vfo.h>
-#include "allocations.h"
+#include "shared_table.h"
 #include "demod_chain.h"
 #include "pfb.h"
 #include "radio.h"
 #include "sweep.h"
 
 int child_main(int fd, uint32_t hz, const std::string& dir, const std::string& start_utc, double iq_rate,
-	       Allocations* allocations, int voice_fd, double span_center_hz, bool per_carrier,
-	       size_t slot);
+	       SharedTable* table, int voice_fd, double span_center_hz, bool per_carrier,
+	       size_t lane);
 int stitch_main(int fd, const std::string& dir, size_t max_gssi);
 
 // No correction by default. Every receiver has some frequency error, but it
@@ -63,18 +63,18 @@ static const char* USAGE =
 	"  calls/<GSSI>.wav   the speech of one talkgroup, 8 kHz mono s16, no silence\n"
 	"  calls.log          one line for each decoded voice frame, and one for\n"
 	"                     each clear call that this run could not record:\n"
-	"                       UNTUNED  no slot followed that carrier yet, and a\n"
-	"                                free slot has now taken it\n"
-	"                       NOSLOT   no slot followed it and the pool is full\n"
+	"                       LEARNED  no lane followed that carrier yet, and a\n"
+	"                                free lane has now taken it\n"
+	"                       NOLANE   no lane followed it and the pool is full\n"
 	"                       OUTSIDE  the carrier lies outside the captured span,\n"
-	"                                so no slot can reach it. Move --center. The\n"
+	"                                so no lane can reach it. Move --center. The\n"
 	"                                default rate is already the highest the\n"
 	"                                receiver takes, so the span cannot widen\n"
 	"                       BADFREQ  the grant named a frequency megahertz away\n"
 	"                                from the span, so that grant decoded wrong.\n"
 	"                                Nothing can be done about it\n"
-	"  timemap.log        anchors that tie a WAV position to a capture sample\n"
-	"  clock.log          UTC against the sample counter, one line each second\n"
+	"  timemap.log        anchors that tie a WAV position to a VFO sample\n"
+	"  clock.log          UTC against the VFO sample counter, one line each second\n"
 	"\n"
 	"radio options:\n"
 	"  --center HZ        Centre frequency of the receiver. Default: the midpoint\n"
@@ -89,10 +89,10 @@ static const char* USAGE =
 	"                     of one network mean nothing on another. \"sweep\" finds\n"
 	"                     them.\n"
 	"                     The list must hold every control carrier, because\n"
-	"                     every grant arrives on one of those, and a free slot\n"
+	"                     every grant arrives on one of those, and a free lane\n"
 	"                     of the pool then follows each traffic carrier that a\n"
 	"                     grant names. Naming a traffic carrier as well is only\n"
-	"                     a convenience: a slot is already on it when its first\n"
+	"                     a convenience: a lane is already on it when its first\n"
 	"                     call starts, so the head of that call survives the\n"
 	"                     time a retune costs.\n"
 	"                     DL_HZ arguments name the same list. Give one form or\n"
@@ -105,7 +105,7 @@ static const char* USAGE =
 	"  --rate HZ          Sample rate of the receiver, and so the width of one\n"
 	"                     span. \"run\" defaults to 3200000. \"sweep\" instead asks\n"
 	"                     for a rate that holds the TETRA band (or a narrower\n"
-	"                     --band) in one span, with a little extra so a stick\n"
+	"                     --band) in one span, with a little extra so a receiver\n"
 	"                     that snaps or lists a coarse rate still covers, and\n"
 	"                     reports it. Give this only to hold it below that.\n"
 	"                     A rate that the link cannot carry (a Pluto on USB\n"
@@ -136,17 +136,17 @@ static const char* USAGE =
 	"                     each carrier, beside the calls. This costs much more CPU\n"
 	"                     time, because it decodes the speech a second time.\n"
 	"                     Default off.\n"
-	"  --max-gssi N       Limit on the number of talkgroup writer processes. A\n"
+	"  --max-gssi N       Limit on the number of talkgroup worker processes. A\n"
 	"                     corrupt GSSI on the air cannot then exhaust the process\n"
 	"                     table. Default 256.\n"
 	"\n"
 	"carrier pool options:\n"
 	"  --max-carriers N   Size of the carrier pool. --carriers seeds it, and each\n"
-	"                     free slot waits for a control carrier to grant a clear\n"
-	"                     call on a carrier that no slot follows. A slot is never\n"
+	"                     free lane waits for a control carrier to grant a clear\n"
+	"                     call on a carrier that no lane follows. A lane is never\n"
 	"                     taken back, because a retune costs the head of a call\n"
 	"                     and a carrier that the network used once it uses again.\n"
-	"                     Each slot costs about 1.6% of one core. Default 15.\n"
+	"                     Each lane costs about 1.6% of one core. Default 15.\n"
 	"                     Each run starts with an empty pool, apart from\n"
 	"                     --carriers.\n"
 	"\n"
@@ -300,7 +300,7 @@ static SweepArgs parse_sweep_args(int argc, char** argv)
 {
 	// The whole of the spectrum that TETRA is given below 470 MHz, so a sweep
 	// with no arguments finds a network wherever it sits in it. A rate of 0
-	// means the widest span that still holds that allocation.
+	// means the widest span that still holds that band.
 	SweepArgs s = { TETRA_BAND_LO, TETRA_BAND_HI, 0, 12500, DEFAULT_TUNE_OFFSET,
 			-1, 0, 0.2, 15, 6, 15, 0, nullptr, nullptr };
 	for (int i = 1; i < argc; i++) {
@@ -537,19 +537,19 @@ static IqSource open_iq(const Args& a)
 	return s;
 }
 
-// The carriers that the slots follow, for the web overview. The next run does
+// The carriers that the lanes follow, for the web overview. The next run does
 // not read it, so each run finds its carriers again.
-static void write_learned(const std::string& path, const Allocations& alloc,
+static void write_learned(const std::string& path, const SharedTable& table,
 			  const std::set<uint32_t>& learned)
 {
 	std::string tmp = path + ".tmp";
 	FILE* f = fopen(tmp.c_str(), "w");
 	if (!f) return;
-	fprintf(f, "# The carriers that the slots of this run follow.\n");
+	fprintf(f, "# The carriers that the lanes of this run follow.\n");
 	// A grant revealed the ones marked "learned". The rest came from the command
 	// line.
-	for (size_t i = 0; i < alloc.slots(); i++)
-		if (uint32_t hz = alloc.assigned(i))
+	for (size_t i = 0; i < table.lanes(); i++)
+		if (uint32_t hz = table.assigned(i))
 			fprintf(f, "%u%s\n", hz, learned.count(hz) ? " learned" : "");
 	fclose(f);
 	// A rename keeps the file whole if the run ends part way through a write.
@@ -698,17 +698,17 @@ int main(int argc, char** argv)
 	status_seconds = a.status;
 	IqSource src = open_iq(a);
 
-	// The carrier list seeds the pool. A free slot waits for a control carrier
-	// to grant a clear call on a carrier that no slot follows. This must settle
+	// The carrier list seeds the pool. A free lane waits for a control carrier
+	// to grant a clear call on a carrier that no lane follows. This must settle
 	// before the shared table is sized, because the table cannot grow later.
 	std::string pool_note;
 	size_t pool = a.max_carriers;
 	if (a.per_carrier) {
-		// A per-carrier WAV is named for its frequency, so a slot that moves
+		// A per-carrier WAV is named for its frequency, so a lane that moves
 		// would have to rotate its files. Keep the list fixed instead.
 		if (pool != a.hz.size())
 			pool_note += "tetra-analyze: --per-carrier keeps the carrier list fixed,"
-					" so there are no free slots\n";
+					" so there are no free lanes\n";
 		pool = a.hz.size();
 	}
 	if (pool < a.hz.size()) {
@@ -717,7 +717,7 @@ int main(int argc, char** argv)
 				" carriers given, so the pool grows to fit them\n";
 		pool = a.hz.size();
 	}
-	Allocations allocations = Allocations::create(a.hz, pool);
+	SharedTable table = SharedTable::create(a.hz, pool);
 	const std::string& run_dir = src.run_dir;
 	std::string start_iso = utc(src.start, "%Y-%m-%dT%H:%M:%SZ");
 	std::cout << "tetra-analyze: run dir " << run_dir << " start_utc " << start_iso
@@ -732,7 +732,7 @@ int main(int argc, char** argv)
 		std::cout << pool_note;
 		if (pool > a.hz.size())
 			std::cout << "tetra-analyze: " + std::to_string(pool - a.hz.size()) +
-					 " free carrier slot(s) for carriers that a grant names\n";
+					 " free lane(s) for carriers that a grant names\n";
 	}
 
 	size_t n = pool;
@@ -758,7 +758,7 @@ int main(int argc, char** argv)
 			close(p[1]);
 			for (size_t j = 0; j < i; j++) close(pipes[j]);
 			exit(child_main(p[0], i < a.hz.size() ? a.hz[i] : 0, run_dir, start_iso,
-					src.rate, &allocations, voice_pipe[1],
+					src.rate, &table, voice_pipe[1],
 					src.center - a.tune_offset, a.per_carrier, i));
 		}
 		close(p[0]);
@@ -773,30 +773,30 @@ int main(int argc, char** argv)
 	sigaction(SIGCHLD, &sa, nullptr);
 
 	int block = iq_block(src.rate);
-	// A wide span goes through the filter bank, and each slot then filters
+	// A wide span goes through the filter bank, and each lane then filters
 	// only the sub-band that holds its carrier. FFTW plans the bank for some
 	// seconds, so this comes before the radio streams into a buffer that no
 	// one reads.
-	Channelizer bank;
+	FilterBank bank;
 	bank.init(src.rate, block);
 	std::vector<dsp::channel::RxVFO> vfos(n);
-	std::vector<int> band(n);
+	std::vector<int> subband(n);
 	{
 		// The resampler prints a line for each VFO. Keep it out of the log.
 		int saved = quiet_begin();
-		// A free slot is parked at the centre. Its child discards the samples
-		// until the parent gives the slot a frequency.
+		// A free lane is parked at the centre. Its child discards the samples
+		// until the parent gives the lane a frequency.
 		for (size_t i = 0; i < n; i++) {
 			double rest;
-			band[i] = bank.channel_of(i < a.hz.size() ? (double)a.hz[i] + a.tune_offset - src.center : 0,
+			subband[i] = bank.subband_of(i < a.hz.size() ? (double)a.hz[i] + a.tune_offset - src.center : 0,
 						  &rest);
-			bank.use(band[i]);
+			bank.use(subband[i]);
 			vfos[i].init(nullptr, bank.out_rate(), VFO_RATE, VFO_BW, rest);
 		}
 		quiet_end(saved);
 	}
-	if (bank.channels() > 1)
-		std::cout << "tetra-analyze: filter bank of " + std::to_string(bank.channels()) +
+	if (bank.subbands() > 1)
+		std::cout << "tetra-analyze: filter bank of " + std::to_string(bank.subbands()) +
 				 " sub-bands at " + std::to_string((long long)bank.out_rate()) + " S/s\n";
 
 	if (src.fd < 0) {
@@ -856,7 +856,7 @@ int main(int argc, char** argv)
 		run_dir.c_str(), start_iso.c_str(), src.rate, VFO_RATE, src.center);
 	log_previous_run(clock_fd, a.out, run_dir);
 	std::string pool_path = run_dir + "/carriers";
-	write_learned(pool_path, allocations, {});
+	write_learned(pool_path, table, {});
 	sd_notify("READY=1");
 	// Which carriers a grant revealed, as against those the command line gave.
 	std::set<uint32_t> learned_hz;
@@ -886,7 +886,7 @@ int main(int argc, char** argv)
 			// A pipe gives 64 KB at a time. A wide span waits for a whole
 			// block, so that each pass gives the threads of the bank enough
 			// work. At the end of the input it takes what is left.
-			if (r > 0 && bank.channels() > 1 && have < raw.size()) continue;
+			if (r > 0 && bank.subbands() > 1 && have < raw.size()) continue;
 			if (r == 0 && have < (size_t)bytes_per) break;
 			cnt = (int)(have / bytes_per);
 			to_cf32(src.fmt, raw.data(), cnt, in);
@@ -894,12 +894,12 @@ int main(int argc, char** argv)
 			memmove(raw.data(), raw.data() + (size_t)cnt * bytes_per, have);
 		}
 		int sub = bank.process(cnt, in);
-		// The slots are independent, so the workers of the bank share them.
-		// Without a bank there is one worker, and this is the plain loop.
-		int nw = bank.workers();
+		// The lanes are independent, so the threads of the bank share them.
+		// Without a bank there is one thread, and this is the plain loop.
+		int nw = bank.threads();
 		run_parallel(nw, [&](int w) {
 			for (size_t i = w; i < n; i += nw)
-				made[i] = pipes[i] >= 0 ? vfos[i].process(sub, bank.out(band[i]), tmp[i]) : 0;
+				made[i] = pipes[i] >= 0 ? vfos[i].process(sub, bank.out(subband[i]), tmp[i]) : 0;
 		});
 		for (size_t i = 0; i < n; i++) {
 			if (pipes[i] < 0) continue;
@@ -914,22 +914,22 @@ int main(int argc, char** argv)
 			stop_flag = 1;
 			break;
 		}
-		// Give a free slot to a carrier that a control carrier granted. One
+		// Give a free lane to a carrier that a control carrier granted. One
 		// pass for each input block is 10 Hz, and a grant stays valid for 30 s.
-		Allocations::Demand d;
-		while (allocations.take(&d)) {
-			int slot = allocations.assign(d.hz);
-			if (slot < 0) continue;
+		SharedTable::Demand d;
+		while (table.take(&d)) {
+			int lane = table.assign(d.hz);
+			if (lane < 0) continue;
 			double rest;
-			band[slot] = bank.channel_of((double)d.hz + a.tune_offset - src.center, &rest);
-			bank.use(band[slot]);
-			vfos[slot].setOffset(rest);
-			std::cout << "tetra-analyze: slot " + std::to_string(slot) + " takes " +
+			subband[lane] = bank.subband_of((double)d.hz + a.tune_offset - src.center, &rest);
+			bank.use(subband[lane]);
+			vfos[lane].setOffset(rest);
+			std::cout << "tetra-analyze: lane " + std::to_string(lane) + " takes " +
 					 std::to_string(d.hz) + " Hz, granted to GSSI " +
-					 std::to_string(d.ssi) + " by " + std::to_string(d.control_hz) +
+					 std::to_string(d.gssi) + " by " + std::to_string(d.control_hz) +
 					 " Hz\n";
 			learned_hz.insert(d.hz);
-			write_learned(pool_path, allocations, learned_hz);
+			write_learned(pool_path, table, learned_hz);
 		}
 		clock_tick(clock_fd, vfo_samples, queue, dropped);
 	}

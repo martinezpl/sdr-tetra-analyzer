@@ -1,4 +1,4 @@
-#include "allocations.h"
+#include "shared_table.h"
 #include "recorder.h"
 
 #include <cstdlib>
@@ -82,23 +82,23 @@ int main()
 		"# tetra-analyze hz=419962500 start_utc=2026-09-04T11:05:00Z iq_rate=2400000 wav=419962500.wav",
 		"# offset_s ISSI GSSI event hz TN usage_marker encr dl_usage chanalloc_hz chanalloc_tn iq_s",
 		"0.000 - - SYSINFO 419962500 1 - - - - - 0.412",
-		"0.000 - 1001 PLAY 419962500 1 7 0 7 - - 3.985",
+		"0.000 - 1001 START 419962500 1 7 0 7 - - 3.985",
 		"0.000 - 1001 FRAME 419962500 1 7 0 7 - - 3.985",
 		"0.060 2001 1001 TALKER 419962500 1 7 0 7 - - 4.045",
 		"0.060 2001 1001 FRAME 419962500 1 7 0 7 - - 4.045",
 		"0.120 2001 1001 END 419962500 1 7 0 - - - 4.045",
-		"0.120 2002 1001 PLAY 419962500 1 7 0 7 - - 4.045",
+		"0.120 2002 1001 START 419962500 1 7 0 7 - - 4.045",
 		"0.120 2002 1001 FRAME 419962500 1 7 0 7 - - 4.045",
 		"0.180 - 1001 REPLACE 419962500 1 7 0 - 420762500 1 4.045",
 		"0.180 3005001 1005 ALLOC 419962500 2 11 0 - 419962500 3 4.045",
 		"0.180 2002 1001 END 419962500 1 - 0 - - - 4.045",
-		"0.180 3005001 1005 PLAY 419962500 2 - 0 - - - 4.045",
+		"0.180 3005001 1005 START 419962500 2 - 0 - - - 4.045",
 		"0.180 3005001 1005 FRAME 419962500 2 - 0 - - - 4.045",
 		"0.240 3005001 1005 END 419962500 2 - 0 - - - 4.045",
-		"0.240 - - PLAY 419962500 3 - 0 - - - 4.045",
+		"0.240 - - START 419962500 3 - 0 - - - 4.045",
 		"0.240 - - FRAME 419962500 3 - 0 - - - 4.045",
 		"0.300 - - END 419962500 3 - 0 - - - 5.545",
-		"0.300 - - PLAY 419962500 3 - 0 1 - - 5.545",
+		"0.300 - - START 419962500 3 - 0 1 - - 5.545",
 		"0.300 - - END 419962500 3 - 0 - - - 5.545",
 	};
 	std::istringstream got(slurp(d + "/419962500.log"));
@@ -123,17 +123,17 @@ int main()
 		// this one. A grant is judged against the carrier that sent it, so a
 		// carrier 0.5 MHz from its control carrier is a carrier, not BADFREQ.
 		const uint32_t control = 390137500, traffic = 390637500;
-		Allocations alloc = Allocations::create({ control }, 2);
+		SharedTable table = SharedTable::create({ control }, 2);
 		std::string wide = d + "/wide";
 		mkdir(wide.c_str(), 0755);
-		Recorder r(control, wide, "2026-09-26T19:37:29Z", 61440000, &alloc, false, 407790000);
+		Recorder r(control, wide, "2026-09-26T19:37:29Z", 61440000, &table, false, 407790000);
 		tetra_mac_event g = ev(TETRA_EV_RESOURCE, 1, -1, 5019918, 10, 0, 0, traffic, 3, 0, 0x02);
 		g.speech = 1;
 		r.on_event(g);
 		r.finish();
 		std::string calls = slurp(wide + "/calls.log");
-		check(calls.find(" UNTUNED") != std::string::npos,
-		      "a grant inside a wide span is UNTUNED, not: " + calls);
+		check(calls.find(" LEARNED") != std::string::npos,
+		      "a grant inside a wide span is LEARNED, not: " + calls);
 	}
 	return fails ? 1 : 0;
 }

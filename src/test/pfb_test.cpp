@@ -36,25 +36,25 @@ static double response_db(const std::vector<float>& h, double f, double rate)
 
 int main()
 {
-	check(pfb_channels(61440000) == 128, "61.44 MS/s gives 128 sub-bands");
-	check(pfb_channels(3200000) == 1, "3.2 MS/s gives no bank");
-	check(pfb_channels(62537500) == 1, "a rate with few factors of 2 gives no bank");
-	check(pfb_channels(20000000) == 64, "20 MS/s gives 64 sub-bands");
-	pass("pfb_channels");
+	check(pfb_subbands(61440000) == 128, "61.44 MS/s gives 128 sub-bands");
+	check(pfb_subbands(3200000) == 1, "3.2 MS/s gives no bank");
+	check(pfb_subbands(62537500) == 1, "a rate with few factors of 2 gives no bank");
+	check(pfb_subbands(20000000) == 64, "20 MS/s gives 64 sub-bands");
+	pass("pfb_subbands");
 
 	const double rate = 61440000;
 	const int block = 4096;
-	Channelizer bank;
+	FilterBank bank;
 	bank.init(rate, block);
-	const int m = bank.channels(), d = m / 2;
+	const int m = bank.subbands(), d = m / 2;
 	const double spacing = rate / m;
 	check(bank.out_rate() == 960000, "out_rate");
 
 	double rest;
-	check(bank.channel_of(-200000, &rest) == 0 && std::fabs(rest + 200000) < 1e-6, "channel_of near the centre");
-	check(bank.channel_of(25e6, &rest) == 52 && std::fabs(rest - 40000) < 1e-3, "channel_of above");
-	check(bank.channel_of(-25e6, &rest) == m - 52 && std::fabs(rest + 40000) < 1e-3, "channel_of below");
-	pass("channel_of");
+	check(bank.subband_of(-200000, &rest) == 0 && std::fabs(rest + 200000) < 1e-6, "subband_of near the centre");
+	check(bank.subband_of(25e6, &rest) == 52 && std::fabs(rest - 40000) < 1e-3, "subband_of above");
+	check(bank.subband_of(-25e6, &rest) == m - 52 && std::fabs(rest + 40000) < 1e-3, "subband_of below");
+	pass("subband_of");
 
 	// A carrier 15 kHz wide at the worst place in its sub-band is flat, and
 	// nothing that folds onto it gets through.
@@ -106,9 +106,9 @@ int main()
 	check(err < 1e-4 * peak, "matches the definition");
 	pass("sub-bands");
 
-	Channelizer thru;
+	FilterBank thru;
 	thru.init(3200000, block);
-	check(thru.channels() == 1 && thru.out_rate() == 3200000, "no bank at 3.2 MS/s");
+	check(thru.subbands() == 1 && thru.out_rate() == 3200000, "no bank at 3.2 MS/s");
 	check(thru.process(123, x.data()) == 123 && thru.out(0) == x.data(), "passes the input through");
 	pass("pass-through");
 	return 0;

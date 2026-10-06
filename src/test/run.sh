@@ -149,17 +149,17 @@ else
 	check_wavs "$B"/*.wav "$A"/*.wav && pass "WAV headers consistent" || fail "WAV headers"
 
 	cat "$B"/*.log | awk '!/^#/ && ($2 == 16777215 || $3 == 16777215) { bad++ } END { exit bad > 0 }' && pass "no dummy SSI" || fail "dummy SSI 16777215 logged"
-	cat "$B"/*.log | awk '!/^#/ && $4 == "PLAY" && $8 != 0 { bad++ } END { exit bad > 0 }' && pass "every PLAY has encr 0" || fail "PLAY with encr != 0"
+	cat "$B"/*.log | awk '!/^#/ && $4 == "START" && $8 != 0 { bad++ } END { exit bad > 0 }' && pass "every START has encr 0" || fail "START with encr != 0"
 	for hz in $HZ1 $HZ2; do
-		n=$(grep -c " PLAY " "$B/$hz.log")
-		echo "info $hz: PLAY lines $n"
+		n=$(grep -c " START " "$B/$hz.log")
+		echo "info $hz: START lines $n"
 	done
 
 	cmp -s "$B/$HZ1.wav" "$A/$HZ1.wav" && pass "codec isolation: $HZ1.wav identical alone vs alongside $HZ2" || fail "$HZ1.wav differs alone vs alongside"
 	cmp -s "$B/$HZ1.log" "$A/$HZ1.log" && pass "$HZ1.log identical alone vs alongside" || fail "$HZ1.log differs alone vs alongside"
 
 	awk -v h1="$HZ1" -v h2="$HZ2" '
-		!/^#/ && $4 == "PLAY" { open[$5, $3] = $12 }
+		!/^#/ && $4 == "START" { open[$5, $3] = $12 }
 		!/^#/ && $4 == "END" && (($5, $3) in open) { n = ++cnt[$5]; s[$5, n] = open[$5, $3]; e[$5, n] = $12; gssi[$5, n] = $3; delete open[$5, $3] }
 		END {
 			for (i = 1; i <= cnt[h1]; i++) for (j = 1; j <= cnt[h2]; j++)
@@ -167,18 +167,18 @@ else
 					printf "info GSSI %s plays on both Hz at iq_s %.3f..%.3f / %.3f..%.3f\n", gssi[h1, i], s[h1, i], e[h1, i], s[h2, j], e[h2, j]; found = 1
 				}
 			exit !found
-		}' "$B/$HZ1.log" "$B/$HZ2.log" && pass "same GSSI PLAY on both Hz at the same time" || echo "NOT OBSERVED: same GSSI on both Hz at the same time"
+		}' "$B/$HZ1.log" "$B/$HZ2.log" && pass "same GSSI START on both Hz at the same time" || echo "NOT OBSERVED: same GSSI on both Hz at the same time"
 
 	awk -v h1="$HZ1" -v h2="$HZ2" '
 		!/^#/ && $4 == "REPLACE" && $10 == h1 + h2 - $5 { rep[++nr] = $12; rgssi[nr] = $3; rto[nr] = $10 }
-		!/^#/ && $4 == "PLAY" { np++; pt[np] = $12; pgssi[np] = $3; phz[np] = $5 }
+		!/^#/ && $4 == "START" { np++; pt[np] = $12; pgssi[np] = $3; phz[np] = $5 }
 		END {
 			for (i = 1; i <= nr; i++) for (j = 1; j <= np; j++)
 				if (phz[j] == rto[i] && pgssi[j] == rgssi[i] && pt[j] >= rep[i] && pt[j] <= rep[i] + 2) {
-					printf "info REPLACE GSSI %s -> %s at iq_s %.3f, PLAY there at %.3f\n", rgssi[i], rto[i], rep[i], pt[j]; found = 1
+					printf "info REPLACE GSSI %s -> %s at iq_s %.3f, START there at %.3f\n", rgssi[i], rto[i], rep[i], pt[j]; found = 1
 				}
 			exit !found
-		}' "$B/$HZ1.log" "$B/$HZ2.log" && pass "REPLACE followed by PLAY on the target Hz" || echo "NOT OBSERVED: REPLACE to the sibling Hz followed by PLAY there"
+		}' "$B/$HZ1.log" "$B/$HZ2.log" && pass "REPLACE followed by START on the target Hz" || echo "NOT OBSERVED: REPLACE to the sibling Hz followed by START there"
 	echo "recordings kept in $TMP"; trap - EXIT
 fi
 echo "$fails failure(s)"

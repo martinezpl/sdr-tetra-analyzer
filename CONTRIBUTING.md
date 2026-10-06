@@ -8,7 +8,7 @@ change, replay the same input, and compare the output byte for byte.
 
 ## 1. Capture a golden file, once
 
-Record raw IQ from the dongle over the carriers you use. Ten minutes should be
+Record raw IQ from the receiver over the carriers you use. Ten minutes should be
 enough to hold a few hundred voice frames:
 
 ```
@@ -46,7 +46,7 @@ releases, and a carrier outside the captured span decodes nothing. The
 example below matches the capture in step 1.
 
 Pin everything else that can vary. `--start-utc` fixes the run directory
-name, and `--max-carriers` equal to the carrier count leaves no free slot:
+name, and `--max-carriers` equal to the carrier count leaves no free lane:
 
 ```
 ./tetra-analyze run --iq ~/golden.cu8 --fmt cu8 --rate 3200000 \
@@ -115,8 +115,8 @@ your change could break in silence.
 ## What to be careful with
 
 **The decoder keeps state in several places.** `tetra_mac_state`, the display
-state, the crypto state and the fragment slots all carry it. One stale field
-is enough to suppress playback for the rest of a run. That is why a slot that
+state, the crypto state and the fragment buffers all carry it. One stale field
+is enough to suppress playback for the rest of a run. That is why a lane that
 changes frequency rebuilds the whole decoder instead of resetting fields.
 
 **`pwrite` and `O_APPEND` do not mix.** On Linux `O_APPEND` makes `pwrite`

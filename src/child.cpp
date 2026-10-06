@@ -1,5 +1,5 @@
 #include "recorder.h"
-#include "allocations.h"
+#include "shared_table.h"
 #include "voice_frame.h"
 
 #include <cerrno>
@@ -23,9 +23,9 @@ struct VoiceSink {
 	uint64_t sample;
 };
 
-// Everything that belongs to one frequency. A slot that changes frequency
+// Everything that belongs to one frequency. A lane that changes frequency
 // throws all of it away and builds it again. The state of this decoder reaches
-// into the display state, the crypto state and the fragment slots, and one
+// into the display state, the crypto state and the fragment buffers, and one
 // stale field is enough to suppress playback for the rest of the run, so a
 // rebuild is the only reset that cannot miss one.
 struct Decoder {
@@ -58,10 +58,10 @@ static void decoder_init(Decoder& d, uint32_t hz, Recorder* rec, VoiceSink* voic
 	tms->put_voice_data = [](void* p, int n, int16_t* pcm) { ((Recorder*)p)->on_voice(pcm, n); };
 	tms->put_voice_bits_ctx = voice;
 	tms->put_voice_bits = [](void* p, uint32_t frame, uint32_t hz, uint32_t gssi, uint32_t issi,
-				 uint32_t control_hz, uint8_t tn, uint8_t usage, int8_t encr,
+				 uint32_t control_hz, uint8_t tn, uint8_t usage_marker, int8_t encr,
 				 const uint8_t* bits) {
 		auto* sink = (VoiceSink*)p;
-		VoiceFrame v = { sink->sample, frame, hz, control_hz, gssi, issi, tn, usage, encr };
+		VoiceFrame v = { sink->sample, frame, hz, control_hz, gssi, issi, tn, usage_marker, encr };
 		memcpy(v.bits, bits, sizeof v.bits);
 		while (write(sink->fd, &v, sizeof v) < 0) {
 			if (errno == EINTR) continue;
@@ -112,12 +112,12 @@ static int read_block(int fd, void* buf, size_t n)
 }
 
 int child_main(int fd, uint32_t hz, const std::string& dir, const std::string& start_utc, double iq_rate,
-	       Allocations* allocations, int voice_fd, double span_center_hz, bool per_carrier,
-	       size_t slot)
+	       SharedTable* table, int voice_fd, double span_center_hz, bool per_carrier,
+	       size_t lane)
 {
 	signal(SIGINT, SIG_IGN);
 	signal(SIGTERM, SIG_IGN);
-	Recorder rec(hz, dir, start_utc, iq_rate, allocations, per_carrier, span_center_hz);
+	Recorder rec(hz, dir, start_utc, iq_rate, table, per_carrier, span_center_hz);
 	tetra_codec_init_once();
 
 	VoiceSink voice = { voice_fd, 0 };
@@ -139,13 +139,13 @@ int child_main(int fd, uint32_t hz, const std::string& dir, const std::string& s
 		}
 		int n = got / sizeof(dsp::complex_t);
 		if (!n) break;
-		// The parent feeds every slot, free or not, so each child counts the
+		// The parent feeds every lane, free or not, so each child counts the
 		// same samples. The grants in the shared table are stamped with that
-		// count, so a slot filled late still reads them on the same timebase.
+		// count, so a lane filled late still reads them on the same timebase.
 		processed_samples += n;
 		voice.sample = processed_samples;
 
-		uint32_t want = allocations ? allocations->assigned(slot) : hz;
+		uint32_t want = table ? table->assigned(lane) : hz;
 		if (want != following) {
 			if (following) decoder_free(dec);
 			following = want;

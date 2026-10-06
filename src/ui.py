@@ -30,11 +30,11 @@ import time
 from bisect import bisect_right
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VFO_RATE = 36000.0  # capture samples for each second, see demod_chain.h
+VFO_RATE = 36000.0  # VFO samples for each second, see demod_chain.h
 FRAME = 480  # WAV samples for each calls.log line, see stitch.cpp
 HDR = 44  # bytes of WAV header, see recorder.cpp
 RATE = 8000.0  # WAV sample rate
-MISSED = ("OUTSIDE", "BADFREQ", "NOSLOT", "UNTUNED")
+MISSED = ("OUTSIDE", "BADFREQ", "NOLANE", "LEARNED")
 
 
 def newest_run(out):
@@ -128,7 +128,7 @@ def parse_clock(path, st):
 
 
 def sample_to_utc(rows, keys, sample):
-    """A capture sample as a UTC epoch, interpolated inside one clock.log row.
+    """A VFO sample as a UTC epoch, interpolated inside one clock.log row.
     keys is the sample column of rows, built once: rebuilding it here cost a
     pass over the whole log for every talkgroup and every missed call."""
     if not rows:
@@ -271,7 +271,7 @@ def scan(out):
 
     # The pool, as the run was given it and as grants filled it.
     followed = sorted(int(h) for h in carriers)
-    # RUN/carriers holds every carrier a slot follows. A line marked "learned"
+    # RUN/carriers holds every carrier a lane follows. A line marked "learned"
     # is one that a grant revealed; the rest came from the command line.
     pool, learned = [], []
     try:
@@ -295,7 +295,7 @@ def scan(out):
         "center": center,
         "low": center - half if half else None,
         "high": center + half if half else None,
-        # Past 80% of Nyquist the dongle rolls off and a carrier loses SNR.
+        # Past 80% of Nyquist the receiver rolls off and a carrier loses SNR.
         "good_low": center - 0.8 * half if half else None,
         "good_high": center + 0.8 * half if half else None,
     }
@@ -499,7 +499,7 @@ td.num,th.num{text-align:right;padding-right:16px}
 audio{height:28px;vertical-align:middle}
 .empty{color:var(--dim);padding:8px 0}
 
-/* The band. The hatched ground is what the dongle does not receive; the solid
+/* The band. The hatched ground is what the receiver does not capture; the solid
    block is the captured span; the lighter block inside it is clear of the
    roll-off. */
 .band{position:relative;height:136px;border:1px solid var(--line);
@@ -655,13 +655,13 @@ function band(d){
   const x = h => Math.max(0, Math.min(100, ((h - lo)/(hi - lo))*100));
   const L = x(s.low), H = x(s.high), GL = x(s.good_low), GH = x(s.good_high);
   const tipSpan = "Captured span " + mhz(s.low) + " to " + mhz(s.high) +
-    " MHz. The dongle receives all of this at once, and a carrier outside it "
+    " MHz. The receiver captures all of this at once, and a carrier outside it "
     + "cannot be recorded at any setting.";
   const tipClear = "Clear of the roll-off: inside 80% of Nyquist, where a carrier "
     + "keeps its full sensitivity. " + mhz(s.good_low) + " to " + mhz(s.good_high) + " MHz.";
   const tipRoll = "Roll-off: still inside the span and still decoded, but the filter "
-    + "of the dongle is falling away here, so a carrier loses SNR.";
-  const tipOut = "Not received. The dongle is not listening to these frequencies, so a "
+    + "of the receiver is falling away here, so a carrier loses SNR.";
+  const tipOut = "Not received. The receiver is not tuned to these frequencies, so a "
     + "grant naming one is reported but cannot be recorded.";
   el.innerHTML =
     '<div class="covered" style="left:'+L+'%;width:'+(H-L)+'%"></div>' +
@@ -725,12 +725,12 @@ async function load(){
   const peak = h.peak_queue|0;
   const cells = [
     ["recording for", dur(h.seconds||0), "",
-     "How long this run has been going, counted from the samples the dongle "+
+     "How long this run has been going, counted from the samples the receiver "+
      "delivered, not from the wall clock."],
     // Dropped is a running total and means IQ was lost. Queue is the warning
     // that comes first: the peak is of the whole run, the other of this second.
     ["dropped", drop, drop? "bad":"ok",
-     "Blocks of radio the dongle produced that this program could not take in "+
+     "Blocks of IQ the receiver produced that this program could not take in "+
      "time. Every one is lost audio that no later fix recovers. It is a running "+
      "total for the run and it must stay at zero."],
     ["queue now/peak", (h.queue|0)+"/"+peak, peak>40? "bad" : peak? "warn":"ok",
@@ -755,9 +755,9 @@ async function load(){
      "Carriers that have decoded at least one voice frame in this run."],
     ["learned", d.learned.length, "",
      "Carriers discovered: a control carrier granted a call on them, "+
-     "and a free slot of the pool tuned to them and stayed."],
+     "and a free lane of the pool tuned to them and stayed."],
     ["not recorded", d.missed_total, d.missed_total? "warn":"ok",
-     "Clear calls this run could not take, because no slot held that carrier, or "+
+     "Clear calls this run could not take, because no lane held that carrier, or "+
      "the carrier lies outside the span. This is a coverage problem, not a "+
      "performance one: see the list at the foot of the page for the reason of "+
      "each. Dropped is the number to watch for performance."]);
@@ -767,23 +767,23 @@ async function load(){
 
   band(d);
   head("h-band", "Band covered",
-    "What the dongle receives, drawn across frequency. The lighter block inside it is clear of the "+
+    "What the receiver captures, drawn across frequency. The lighter block inside it is clear of the "+
     "roll-off, meaning inside 80% of Nyquist, where a carrier keeps its full "+
     "sensitivity; between that and the edge a carrier still decodes but loses "+
     "SNR. The dashed line is the centre. Blue marks a control carrier, green a "+
     "traffic carrier with its height by frames decoded, red a frequency a grant "+
-    "named that no slot recorded. Hover any region or mark for its own detail.");
+    "named that no lane recorded. Hover any region or mark for its own detail.");
   head("h-tg", "Talkgroups",
     "One row for each talkgroup (GSSI) with recorded speech, and its own WAV. "+
     "Carriers lists every carrier it has been heard on, which is more than one "+
-    "when the network moves a call. Radios lists the ISSIs that transmitted.");
+    "when the network moves a call. Terminals lists the ISSIs that transmitted.");
   head("h-car", "Carriers",
-    "Every frequency this run has seen, whether or not a slot could reach it. "+
+    "Every frequency this run has seen, whether or not a lane could reach it. "+
     "Given means the command line named it; learned means a grant revealed it "+
-    "and a free slot tuned to it. A row with in span \u201cno\u201d is a real "+
-    "carrier this dongle cannot reach at the current centre.");
+    "and a free lane tuned to it. A row with in span \u201cno\u201d is a real "+
+    "carrier this receiver cannot reach at the current centre.");
   head("h-miss", "Calls not recorded",
-    "Clear calls that went out on air while no slot was on their carrier. This "+
+    "Clear calls that went out on air while no lane was on their carrier. This "+
     "is a coverage problem, not a performance one: nothing was dropped, the "+
     "program was simply not listening there. Each row says why.");
 
@@ -794,7 +794,7 @@ async function load(){
     {h:"speech", cls:"num", f:r=>dur(r.seconds)},
     {h:"frames", cls:"num", f:r=>r.frames},
     {h:"carriers", f:r=>r.carriers.map(c=>mhz(c.hz)).join(" ")},
-    {h:"radios (ISSI)", f:r=>r.issis.map(i=>esc(i.issi)).join(" ")||"—"},
+    {h:"terminals (ISSI)", f:r=>r.issis.map(i=>esc(i.issi)).join(" ")||"—"},
     {h:"first heard", f:r=>esc(hhmm(r.first_utc))},
     {h:"last heard", f:r=>esc(hhmm(r.last_utc))},
   ], d.talkgroups, "nothing recorded yet", r=>r.gssi);
@@ -811,7 +811,7 @@ async function load(){
     {h:"frames", cls:"num", f:r=>r.frames},
     {h:"in span", f:r=>r.in_span? '<span class="ok">yes</span>':'<span class="bad">no</span>'},
   ],
-  // Everything the run has seen a frequency for, whether or not a slot could
+  // Everything the run has seen a frequency for, whether or not a lane could
   // reach it. BADFREQ is left out: a decode error is not a carrier.
   d.marks.filter(m=>m.role !== "BADFREQ"),
      "no carrier has decoded yet", r=>r.hz);
@@ -822,13 +822,13 @@ async function load(){
   tbl("miss", [
     {h:"time", f:r=>esc(hhmm(r.utc))},
     {h:"GSSI", f:r=>esc(r.gssi)},
-    {h:"radio", f:r=>esc(r.issi)},
+    {h:"terminal", f:r=>esc(r.issi)},
     {h:"carrier", f:r=>mhz(r.hz)+" MHz"},
     {h:"granted by", f:r=>mhz(r.control_hz)+" MHz"},
     {h:"why", f:r=>({OUTSIDE:"outside the span — move --center or raise --rate",
                      BADFREQ:"the grant decoded wrong",
-                     NOSLOT:"the carrier pool is full — raise --max-carriers",
-                     UNTUNED:"no slot held it yet; one has taken it now"}[r.status]||r.status)},
+                     NOLANE:"the carrier pool is full — raise --max-carriers",
+                     LEARNED:"no lane held it yet; one has taken it now"}[r.status]||r.status)},
   ], d.missed.slice().reverse(), "every granted call was recorded",
      r=>r.sample+"/"+r.hz+"/"+r.gssi);
 }

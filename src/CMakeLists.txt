@@ -91,7 +91,7 @@ endif ()
 
 # Factories come from plugins on disk, not from linking SoapySDR. ./build.sh
 # installs the ones this OS ships. A configure with none still builds: --iq
-# does not need a stick.
+# does not need a receiver.
 find_program(SOAPYSDRUTIL_EXECUTABLE NAMES SoapySDRUtil)
 if (SOAPYSDRUTIL_EXECUTABLE)
     execute_process(COMMAND ${SOAPYSDRUTIL_EXECUTABLE} --info
@@ -109,7 +109,7 @@ if (SOAPYSDRUTIL_EXECUTABLE)
     endif ()
 endif ()
 
-add_executable(tetra-analyze main.cpp child.cpp recorder.cpp allocations.cpp radio.cpp stitch.cpp sweep.cpp pfb.cpp ${DEC_SRC})
+add_executable(tetra-analyze main.cpp child.cpp recorder.cpp shared_table.cpp radio.cpp stitch.cpp sweep.cpp pfb.cpp ${DEC_SRC})
 target_include_directories(tetra-analyze PRIVATE . ${SRC} ${DEC}/src ${DEC}/codec ${SDRPP_CORE_ROOT}/src ${VOLK_INCLUDE_DIR} ${FFTW_INCLUDE_DIR})
 target_link_libraries(tetra-analyze PRIVATE ${VOLK_LIBRARY} ${FFTW_LIBRARY})
 if (SoapySDR_FOUND)
@@ -127,11 +127,11 @@ set_target_properties(tetra-analyze PROPERTIES RUNTIME_OUTPUT_DIRECTORY "$<1:${R
 
 add_executable(gen_iq test/gen_iq.cpp)
 
-add_executable(events_test test/events_test.cpp recorder.cpp allocations.cpp)
+add_executable(events_test test/events_test.cpp recorder.cpp shared_table.cpp)
 target_include_directories(events_test PRIVATE . ${DEC}/src)
 
-add_executable(allocations_test test/allocations_test.cpp allocations.cpp)
-target_include_directories(allocations_test PRIVATE .)
+add_executable(shared_table_test test/shared_table_test.cpp shared_table.cpp)
+target_include_directories(shared_table_test PRIVATE .)
 
 add_executable(radio_test test/radio_test.cpp radio.cpp)
 target_include_directories(radio_test PRIVATE .)
@@ -148,6 +148,6 @@ target_link_libraries(pfb_test PRIVATE ${VOLK_LIBRARY} ${FFTW_LIBRARY})
 
 enable_testing()
 add_test(NAME events_test COMMAND events_test)
-add_test(NAME allocations_test COMMAND allocations_test)
+add_test(NAME shared_table_test COMMAND shared_table_test)
 add_test(NAME radio_test COMMAND radio_test)
 add_test(NAME pfb_test COMMAND pfb_test)

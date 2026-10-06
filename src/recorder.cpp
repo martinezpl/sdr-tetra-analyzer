@@ -1,5 +1,5 @@
 #include "recorder.h"
-#include "allocations.h"
+#include "shared_table.h"
 
 #include <cerrno>
 #include <cmath>
@@ -75,8 +75,8 @@ void WavWriter::close()
 }
 
 Recorder::Recorder(uint32_t hz, const std::string& dir, const std::string& start_utc_iso, double iq_rate,
-		   Allocations* allocations, bool output_files, double span_center_hz)
-	: hz(hz), dir(dir), allocations(allocations), iq_rate(iq_rate), span_center_hz(span_center_hz)
+		   SharedTable* table, bool output_files, double span_center_hz)
+	: hz(hz), dir(dir), table(table), iq_rate(iq_rate), span_center_hz(span_center_hz)
 {
 	if (!output_files) return;
 	std::string base = dir + "/" + std::to_string(hz);
@@ -111,13 +111,13 @@ static long long z(uint32_t v) { return v ? (long long)v : -1; }
 void Recorder::open_talkspurt(const tetra_mac_event& ev)
 {
 	cur = Talkspurt{ ev.tn, ev.ssi, ev.issi, ev.encr, iq_s, iq_s, wav.samples() };
-	int dl = slot_dl_usage[ev.tn - 1];
-	line("PLAY", ev.tn, z(ev.ssi), z(ev.issi), marker_of(dl), ev.encr, dl, -1, -1);
+	int dl = tn_dl_usage[ev.tn - 1];
+	line("START", ev.tn, z(ev.ssi), z(ev.issi), marker_of(dl), ev.encr, dl, -1, -1);
 }
 
 void Recorder::end_talkspurt(int dl_usage)
 {
-	line("END", cur->tn, z(cur->gssi), z(cur->issi), marker_of(slot_dl_usage[cur->tn - 1]), cur->encr,
+	line("END", cur->tn, z(cur->gssi), z(cur->issi), marker_of(tn_dl_usage[cur->tn - 1]), cur->encr,
 	     dl_usage, -1, -1);
 	cur.reset();
 }
@@ -125,11 +125,11 @@ void Recorder::end_talkspurt(int dl_usage)
 void Recorder::retune(uint32_t new_hz)
 {
 	// A talkspurt belongs to the old frequency. Close it before the identity
-	// of this slot changes, or its END line would name the new carrier.
+	// of this lane changes, or its END line would name the new carrier.
 	if (cur) end_talkspurt(-1);
 	hz = new_hz;
 	refused.clear();
-	for (int i = 0; i < 4; i++) slot_dl_usage[i] = -1;
+	for (int i = 0; i < 4; i++) tn_dl_usage[i] = -1;
 }
 
 void Recorder::advance(double seconds_of_input)
@@ -156,7 +156,7 @@ void Recorder::on_event(const tetra_mac_event& ev)
 			}
 			if (ev.issi && !cur->issi) {
 				cur->issi = ev.issi;
-				int dl = slot_dl_usage[ev.tn - 1];
+				int dl = tn_dl_usage[ev.tn - 1];
 				line("TALKER", ev.tn, z(cur->gssi), ev.issi, marker_of(dl), cur->encr,
 				     dl, -1, -1);
 			}
@@ -167,19 +167,19 @@ void Recorder::on_event(const tetra_mac_event& ev)
 		open_talkspurt(ev);
 		return;
 	case TETRA_EV_SLOT:
-		slot_dl_usage[ev.tn - 1] = ev.dl_usage;
+		tn_dl_usage[ev.tn - 1] = ev.dl_usage;
 		return;
 	case TETRA_EV_RESOURCE:
 		if (ev.alloc_type < 0) return;
-		if (allocations && ev.encr == 0 && ev.speech == 1 && ev.e2ee == 0 &&
+		if (table && ev.encr == 0 && ev.speech == 1 && ev.e2ee == 0 &&
 		    ev.alloc_hz && ev.alloc_hz != hz &&
-		    !allocations->publish(ev.alloc_hz, ev.alloc_tn_mask, ev.usage_marker, ev.ssi,
+		    !table->publish(ev.alloc_hz, ev.alloc_tn_mask, ev.usage_marker, ev.ssi,
 					  ev.issi, processed_samples, hz) &&
 		    // publish() also gives false for tn_mask 0, which means "go to MCCH", and
 		    // for a corrupt mask. Only a carrier that the table misses counts here.
 		    ev.alloc_tn_mask && !(ev.alloc_tn_mask & 0xf0)) {
-			// No slot follows this carrier, so this clear call is going out on
-			// air unrecorded. Ask the parent for a slot, so the next call on it
+			// No lane follows this carrier, so this clear call is going out on
+			// air unrecorded. Ask the parent for a lane, so the next call on it
 			// is recorded, and report the one that is lost now.
 			// A grant can name a corrupt frequency, so the span test is also
 			// the guard that keeps a wild value out of the pool.
@@ -193,12 +193,12 @@ void Recorder::on_event(const tetra_mac_event& ev)
 				note = "is too far from the span to be a carrier, so that grant decoded wrong";
 			} else if (off + 15e3 >= iq_rate / 2) {
 				status = "OUTSIDE";
-				note = "is outside the captured span. Move --center, or add a second dongle";
-			} else if (allocations->want({ ev.alloc_hz, hz, ev.ssi })) {
-				status = "UNTUNED";
-				note = "is inside the span, so a free carrier slot takes it";
+				note = "is outside the captured span. Move --center, or add a second receiver";
+			} else if (table->want({ ev.alloc_hz, hz, ev.ssi })) {
+				status = "LEARNED";
+				note = "is inside the span, so a free lane takes it";
 			} else {
-				status = "NOSLOT";
+				status = "NOLANE";
 				note = "is inside the span, but the carrier pool is full";
 			}
 			missed_call(status, ev);
@@ -230,22 +230,22 @@ void Recorder::missed_call(const char* status, const tetra_mac_event& ev)
 		calls_fd = ::open((dir + "/calls.log").c_str(), O_WRONLY | O_APPEND | O_CREAT, 0644);
 		if (calls_fd < 0) return;
 	}
-	// The columns of calls.log: capture_sample tdma_frame ISSI GSSI carrier_hz
-	// control_hz TN usage status. A grant gives no frame number and no usage.
+	// The columns of calls.log: vfo_sample tdma_frame ISSI GSSI carrier_hz
+	// control_hz TN usage_marker status. A grant gives no frame number and no marker.
 	dprintf(calls_fd, "%llu - %s %s %u %u %u - %s\n", (unsigned long long)processed_samples,
 		col(z(ev.issi)).c_str(), col(z(ev.ssi)).c_str(), ev.alloc_hz, hz, ev.alloc_tn,
 		status);
 }
 
-bool Recorder::permits_clear(uint8_t tn, int local_encr, uint32_t* ssi, uint32_t* issi,
+bool Recorder::permits_clear(uint8_t tn, int local_encr, uint32_t* gssi, uint32_t* issi,
 			     uint32_t* control_hz) const
 {
-	Allocations::Grant grant = {};
-	if (!allocations || tn < 1 || tn > 4 ||
-	    !allocations->permits_clear(hz, tn, local_encr, slot_dl_usage[tn - 1],
+	SharedTable::Grant grant = {};
+	if (!table || tn < 1 || tn > 4 ||
+	    !table->permits_clear(hz, tn, local_encr, tn_dl_usage[tn - 1],
 					processed_samples, &grant))
 		return false;
-	*ssi = grant.ssi;
+	*gssi = grant.gssi;
 	*issi = grant.issi;
 	*control_hz = grant.control_hz;
 	return true;
@@ -256,7 +256,7 @@ void Recorder::on_voice(const int16_t* pcm, int n)
 	if (!log) return;
 	if (cur) {
 		wav.pad_to(cur->wav_start + (uint64_t)llround((iq_s - cur->iq_start) * 8000));
-		int dl = slot_dl_usage[cur->tn - 1];
+		int dl = tn_dl_usage[cur->tn - 1];
 		line("FRAME", cur->tn, z(cur->gssi), z(cur->issi), marker_of(dl), cur->encr,
 		     dl, -1, -1);
 	}

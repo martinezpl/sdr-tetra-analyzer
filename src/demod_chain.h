@@ -29,7 +29,7 @@ static inline int iq_block(double rate)
 	return n > 0 ? n : 1;
 }
 
-// The resampler of SDR++ and the driver of the dongle both print to stdout
+// The resampler of SDR++ and the driver of the receiver both print to stdout
 // when they start. The log of a run is for the operator, so that chatter goes
 // to /dev/null. Wrap only the setup calls, never the log of this program.
 inline int quiet_begin()

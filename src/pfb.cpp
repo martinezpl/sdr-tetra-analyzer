@@ -7,9 +7,9 @@
 #include <dsp/taps/windowed_sinc.h>
 #include <dsp/window/nuttall.h>
 
-// Sub-bands at most this far apart. A narrower sub-band makes each slot
+// Sub-bands at most this far apart. A narrower sub-band makes each lane
 // cheaper, and the FFT only grows with log2 M. Measured on a Pi 5 at 61.44
-// MS/s with 24 slots: 64 sub-bands cost 1.28 cores, 128 cost 1.05, 256 cost
+// MS/s with 24 lanes: 64 sub-bands cost 1.28 cores, 128 cost 1.05, 256 cost
 // 0.99, but 256 leave the filter less margin.
 static const double MAX_SPACING = 0.5e6;
 // The filter cuts off at the spacing. A carrier needs flat response to 0.5
@@ -18,38 +18,38 @@ static const double MAX_SPACING = 0.5e6;
 // taps for each branch that fold is at -98 dB for 128 sub-bands at 61.44
 // MS/s, and at -79 dB at the narrowest spacing that MAX_SPACING allows.
 static const int TAPS_PER_BRANCH = 8;
-// Below this the span is narrow, and plain slot filters cost little: 15
-// slots at 3.2 MS/s take about a quarter of a core. So a narrow span keeps
+// Below this the span is narrow, and plain VFO filters cost little: 15
+// lanes at 3.2 MS/s take about a quarter of a core. So a narrow span keeps
 // the path that has no bank.
-static const int MIN_CHANNELS = 16;
+static const int MIN_SUBBANDS = 16;
 // The parent, the carrier processes and the driver share the cores.
-static const unsigned MAX_WORKERS = 4;
+static const unsigned MAX_THREADS = 4;
 
-int pfb_channels(double rate)
+int pfb_subbands(double rate)
 {
 	int m = 1;
 	while (rate / m > MAX_SPACING) m *= 2;
-	// An integer sub-band rate gives the resampler of each slot a whole input
+	// An integer sub-band rate gives the VFO of each lane a whole input
 	// rate. The power-of-2 stage inside that SDR++ resampler can still round:
-	// 875 kHz / 16 is 54687.5 Hz, which puts those slots 9 ppm off 36 kS/s.
-	while (m >= MIN_CHANNELS && std::fmod(rate, m / 2) != 0) m /= 2;
-	return m >= MIN_CHANNELS ? m : 1;
+	// 875 kHz / 16 is 54687.5 Hz, which puts those VFOs 9 ppm off 36 kS/s.
+	while (m >= MIN_SUBBANDS && std::fmod(rate, m / 2) != 0) m /= 2;
+	return m >= MIN_SUBBANDS ? m : 1;
 }
 
-Channelizer::~Channelizer()
+FilterBank::~FilterBank()
 {
 	if (plan) fftwf_destroy_plan(plan);
 	for (auto* p : acc) fftwf_free(p);
 	for (auto* p : spec) fftwf_free(p);
 }
 
-void Channelizer::init(double r, int max_block)
+void FilterBank::init(double r, int max_block)
 {
 	rate = r;
-	m = pfb_channels(r);
+	m = pfb_subbands(r);
 	if (m == 1) return;
 	d = m / 2;
-	nw = (int)std::min(MAX_WORKERS, std::max(1u, std::thread::hardware_concurrency()));
+	nw = (int)std::min(MAX_THREADS, std::max(1u, std::thread::hardware_concurrency()));
 	int len = m * TAPS_PER_BRANCH;
 	auto h = dsp::taps::windowedSinc<float>(len, rate / m, rate, dsp::window::nuttall);
 	proto.assign(h.taps, h.taps + len);
@@ -72,11 +72,11 @@ void Channelizer::init(double r, int max_block)
 		acc.push_back(fftwf_alloc_complex(m));
 		spec.push_back(fftwf_alloc_complex(m));
 	}
-	// One plan serves every worker: the new-array execute is thread safe.
+	// One plan serves every thread: the new-array execute is thread safe.
 	plan = fftwf_plan_dft_1d(m, acc[0], spec[0], FFTW_FORWARD, FFTW_MEASURE);
 }
 
-int Channelizer::channel_of(double offset_hz, double* rest_hz) const
+int FilterBank::subband_of(double offset_hz, double* rest_hz) const
 {
 	if (m == 1) {
 		*rest_hz = offset_hz;
@@ -88,7 +88,7 @@ int Channelizer::channel_of(double offset_hz, double* rest_hz) const
 	return (int)(((k % m) + m) % m);
 }
 
-void Channelizer::use(int c)
+void FilterBank::use(int c)
 {
 	if (m == 1 || used[c]) return;
 	used[c] = true;
@@ -96,19 +96,19 @@ void Channelizer::use(int c)
 	outs[c].resize(max_out);
 }
 
-void Channelizer::clear_use()
+void FilterBank::clear_use()
 {
 	if (m == 1) return;
 	used.assign(m, false);
 	used_list.clear();
 }
 
-const dsp::complex_t* Channelizer::out(int c) const
+const dsp::complex_t* FilterBank::out(int c) const
 {
 	return m == 1 ? last_in : outs[c].data();
 }
 
-int Channelizer::process(int count, const dsp::complex_t* in)
+int FilterBank::process(int count, const dsp::complex_t* in)
 {
 	if (m == 1) {
 		last_in = in;
@@ -159,7 +159,7 @@ static void branches(float* __restrict a, const float* __restrict h, const float
 // of the branches. The branches go into acc in reverse, so that both arrays
 // run forward in the inner loop. That reverse and the time g together cost
 // the factor e^(-j 2 pi c (g+1) / m) after a forward FFT.
-void Channelizer::emit(int w, const dsp::complex_t* newest, int k, unsigned long long step)
+void FilterBank::emit(int w, const dsp::complex_t* newest, int k, unsigned long long step)
 {
 	branches((float*)acc[w], taps.data(), (const float*)(newest - (m - 1)), 2 * m);
 	fftwf_execute_dft(plan, acc[w], spec[w]);

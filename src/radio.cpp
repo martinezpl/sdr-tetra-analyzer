@@ -368,7 +368,7 @@ static uint32_t soapy_best_rate(SoapySDR::Device* dev, size_t channel, uint32_t 
 
 // Some drivers read the rate back rounded: a Pluto set to 6 MS/s says
 // 5999999. Keep the rate that was asked for when the two agree to 10 ppm. An
-// odd rate stops the filter bank, and it gives each slot a resampler of 36000
+// odd rate stops the filter bank, and it gives each lane a resampler of 36000
 // phases. A real snap to another rate differs by far more.
 uint32_t radio_settled_rate(double got, uint32_t asked)
 {
@@ -396,7 +396,7 @@ static bool soapy_apply_rate(Radio* r, uint32_t rate)
 // MS/s and throws for the cap, but it takes 61.44 when asked. So such a device
 // also tries the usual fast rates. Then take the widest rate that the device
 // lists, or that its range reaches. If a setting is refused or snaps above the
-// cap, try successively halved rates so a stick that advertises more than it
+// cap, try successively halved rates so a receiver that advertises more than it
 // can stream still opens. An explicit rate is tried once.
 static bool soapy_choose_rate(Radio* r, uint32_t wanted, uint32_t cap)
 {

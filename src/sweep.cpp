@@ -62,7 +62,7 @@ struct Probe {
 	tetra_mac_state* tms = nullptr;
 	tetra_rx_state* trs = nullptr;
 	size_t chan = 0;
-	int band = 0;           // the sub-band of the filter bank that holds it
+	int subband = 0;        // the sub-band of the filter bank that holds it
 };
 
 // A carrier this strong has settled, so its frequency estimate is worth more
@@ -120,7 +120,7 @@ double delivered_rate(Radio* r, dsp::complex_t* buf, int n)
 // A carrier is kept SWEEP_EDGE_HZ clear of the edge, so the scan does too.
 double usable_half(double rate) { return rate / 2 - SWEEP_EDGE_HZ; }
 
-// The dongle rolls off well before the edge of its span. Past this point a
+// The receiver rolls off well before the edge of its span. Past this point a
 // carrier still decodes, but it loses SNR, so a suggested centre avoids it.
 double good_half(double rate) { return 0.8 * (rate / 2); }
 
@@ -238,18 +238,18 @@ int sweep_main(const SweepArgs& a)
 		return 2;
 	}
 
-	// Rate 0 asked for a window that holds the TETRA allocation (or a
-	// narrower --band) in one span. The IQ block size, not the rate, is
-	// what has to stay inside the SDR++ work buffers.
+	// Rate 0 asked for a span that holds the TETRA band (or a narrower
+	// --band). The IQ block size, not the rate, is what has to stay inside
+	// the SDR++ work buffers.
 	double rate = radio_rate(radio);
 	if (!rate) {
 		fprintf(stderr, "tetra-analyze: %s\n", radio_error(RadioErr::bad_rate));
 		radio_close(radio);
 		return 2;
 	}
-	// The IQ window is `rate` hertz wide. If that covers the search band,
+	// The span is `rate` hertz wide. If that covers the search band,
 	// one tune is enough. usable_half is tighter (15 kHz off each edge);
-	// a stick that snapped to exactly the band width would otherwise
+	// a receiver that snapped to exactly the band width would otherwise
 	// miss by 30 kHz and the 95% overlap loop would add a second span.
 	if (!a.rate && width > rate && one_span_cap) {
 		uint32_t wider = radio_max_rate(radio, one_span_cap);
@@ -305,23 +305,23 @@ int sweep_main(const SweepArgs& a)
 	auto* bits = dsp::buffer::alloc<uint8_t>(2 * block);
 	int scan_blocks = std::max(1, (int)llround(a.scan * rate / block));
 	// A wide span goes through the filter bank, and each VFO then filters one
-	// narrow sub-band. Its workers also share the VFOs of the scan.
-	Channelizer bank;
+	// narrow sub-band. Its threads also share the VFOs of the scan.
+	FilterBank bank;
 	bank.init(rate, block);
-	int nw = bank.workers();
-	if (bank.channels() > 1)
-		printf("tetra-analyze: filter bank of %d sub-bands at %.0f S/s\n", bank.channels(),
+	int nw = bank.threads();
+	if (bank.subbands() > 1)
+		printf("tetra-analyze: filter bank of %d sub-bands at %.0f S/s\n", bank.subbands(),
 		       bank.out_rate());
 	std::vector<dsp::complex_t*> outw(nw, out);
 	for (int w = 1; w < nw; w++) outw[w] = dsp::buffer::alloc<dsp::complex_t>(block);
-	// A group holds every VFO that one pass of the input feeds. The VFOs are
+	// A batch holds every VFO that one pass of the input feeds. The VFOs are
 	// built once: setOffset moves the rotator, and the filter taps stay. On a
-	// sub-band a VFO is cheap, so each worker takes 32 of them.
-	const size_t GROUP = 32 * nw;
+	// sub-band a VFO is cheap, so each thread takes 32 of them.
+	const size_t BATCH = 32 * nw;
 	int status = 0;
 	int saved = quiet_begin();
-	std::vector<dsp::channel::RxVFO> vfos(GROUP);
-	std::vector<int> vband(GROUP);
+	std::vector<dsp::channel::RxVFO> vfos(BATCH);
+	std::vector<int> subband(BATCH);
 	for (auto& v : vfos) v.init(nullptr, bank.out_rate(), VFO_RATE, VFO_BW, 0);
 	quiet_end(saved);
 
@@ -339,14 +339,14 @@ int sweep_main(const SweepArgs& a)
 				idx.push_back(i);
 		printf("tetra-analyze: span %zu at %.3f MHz, %zu channels\n", s + 1, centers[s] / 1e6,
 		       idx.size());
-		for (size_t g = 0; g < idx.size() && !status; g += GROUP) {
-			size_t n = std::min(GROUP, idx.size() - g);
+		for (size_t g = 0; g < idx.size() && !status; g += BATCH) {
+			size_t n = std::min(BATCH, idx.size() - g);
 			bank.clear_use();
 			for (size_t j = 0; j < n; j++) {
 				double rest;
-				vband[j] = bank.channel_of((double)chans[idx[g + j]].hz + a.tune_offset -
+				subband[j] = bank.subband_of((double)chans[idx[g + j]].hz + a.tune_offset -
 							   centers[s], &rest);
-				bank.use(vband[j]);
+				bank.use(subband[j]);
 				vfos[j].setOffset(rest);
 			}
 			for (int b = 0; b < scan_blocks; b++) {
@@ -357,12 +357,12 @@ int sweep_main(const SweepArgs& a)
 					break;
 				}
 				int sub = bank.process(cnt, in);
-				// Each VFO adds to its own channel only, so the workers
-				// need no lock.
+				// Each VFO adds to its own raster channel only, so the
+				// threads need no lock.
 				run_parallel(nw, [&](int w) {
 					dsp::complex_t* o = outw[w];
 					for (size_t j = w; j < n; j += nw) {
-						int m = vfos[j].process(sub, bank.out(vband[j]), o);
+						int m = vfos[j].process(sub, bank.out(subband[j]), o);
 						double p = 0;
 						for (int k = 0; k < m; k++)
 							p += (double)o[k].re * o[k].re +
@@ -412,20 +412,20 @@ int sweep_main(const SweepArgs& a)
 	// several, and every one that holds a peak is worth a dwell, because a
 	// control carrier anywhere in the band decides what its own cell does.
 	double good = good_half(rate);
-	std::vector<std::vector<size_t>> groups;
+	std::vector<std::vector<size_t>> spans;
 	for (size_t k : peaks) {
 		// Peaks come out in frequency order, so a greedy pass is enough: keep
-		// adding to the open group while the whole group still fits one span.
-		if (!groups.empty()) {
-			double lo = (double)chans[groups.back().front()].hz;
+		// adding to the open span while the whole of it still fits the rate.
+		if (!spans.empty()) {
+			double lo = (double)chans[spans.back().front()].hz;
 			if ((double)chans[k].hz - lo <= 2 * good) {
-				groups.back().push_back(k);
+				spans.back().push_back(k);
 				continue;
 			}
 		}
-		groups.push_back({ k });
+		spans.push_back({ k });
 	}
-	if (!status) printf("tetra-analyze: %zu span(s) to decode\n", groups.size());
+	if (!status) printf("tetra-analyze: %zu span(s) to decode\n", spans.size());
 
 	// A span with more candidates than --max-carriers gets more than one dwell,
 	// strongest first. A wide span holds the whole band, so it often does.
@@ -435,8 +435,8 @@ int sweep_main(const SweepArgs& a)
 		std::vector<size_t> cand;
 	};
 	std::vector<Dwell> dwells;
-	for (size_t g = 0; g < groups.size(); g++) {
-		std::vector<size_t>& all = groups[g];
+	for (size_t g = 0; g < spans.size(); g++) {
+		std::vector<size_t>& all = spans[g];
 		double lo = (double)chans[all.front()].hz;
 		double hi = (double)chans[all.back()].hz;
 		double center = std::round(((lo + hi) / 2 + a.tune_offset) / 10000) * 10000;
@@ -474,8 +474,8 @@ int sweep_main(const SweepArgs& a)
 			probes[i].chan = cand[i];
 			probe_init(probes[i], chans[cand[i]].hz);
 			double rest;
-			probes[i].band = bank.channel_of(hz + a.tune_offset + ppm * hz / 1e6 - dw.center, &rest);
-			bank.use(probes[i].band);
+			probes[i].subband = bank.subband_of(hz + a.tune_offset + ppm * hz / 1e6 - dw.center, &rest);
+			bank.use(probes[i].subband);
 			probes[i].vfo.init(nullptr, bank.out_rate(), VFO_RATE, VFO_BW, rest);
 		}
 		quiet_end(saved2);
@@ -488,11 +488,11 @@ int sweep_main(const SweepArgs& a)
 				break;
 			}
 			// The decoder fills static tables the first time, so the
-			// probes stay on one thread. The bank uses its workers.
+			// probes stay on one thread. The bank uses its threads.
 			int sub = bank.process(cnt, in);
 			for (size_t i = 0; i < probes.size(); i++) {
 				Probe& p = probes[i];
-				int m = p.vfo.process(sub, bank.out(p.band), out);
+				int m = p.vfo.process(sub, bank.out(p.subband), out);
 				m = p.chain.process(m, out, syms, dibits, bits);
 				for (int off = 0; off < m; off += 2048)
 					tetra_burst_sync_in(p.trs, bits + off, std::min(2048, m - off));
@@ -543,11 +543,11 @@ int sweep_main(const SweepArgs& a)
 		const Dwell& dw = dwells[di];
 		if (dw.parts > 1)
 			printf("tetra-analyze: span %zu of %zu, part %zu of %zu, decode %zu candidate(s) at"
-			       " %.3f MHz for %.0f s\n", dw.span + 1, groups.size(), dw.part + 1, dw.parts,
+			       " %.3f MHz for %.0f s\n", dw.span + 1, spans.size(), dw.part + 1, dw.parts,
 			       dw.cand.size(), dw.center / 1e6, a.dwell);
 		else
 			printf("tetra-analyze: span %zu of %zu, decode %zu candidate(s) at %.3f MHz for %.0f s\n",
-			       dw.span + 1, groups.size(), dw.cand.size(), dw.center / 1e6, a.dwell);
+			       dw.span + 1, spans.size(), dw.cand.size(), dw.center / 1e6, a.dwell);
 		for (size_t k : dw.cand) chans[k].tested = true;
 		for (const Heard& h : decode(dw, a.dwell, cal_ppm)) {
 			Channel& c = chans[h.chan];
@@ -647,52 +647,52 @@ int sweep_main(const SweepArgs& a)
 			       "--dwell tightens it.\n");
 	}
 
-	// One receiver hears one span at a time, so the carriers are grouped into
-	// spans and each group becomes its own "run". A group is opened by a control
+	// One receiver hears one span at a time, so the carriers are grouped by
+	// span, and each span becomes its own run. A run is opened by a control
 	// carrier, because a run without one learns nothing: it would sit on traffic
-	// carriers and never hear a grant. A carrier that no group reaches needs
+	// carriers and never hear a grant. A carrier that no run reaches needs
 	// another receiver.
-	struct Group {
+	struct Run {
 		std::vector<uint32_t> hz;
 		size_t controls = 0;
 	};
-	std::vector<Group> runs;
+	std::vector<Run> runs;
 	std::vector<uint32_t> orphans;
-	// A group must be placed against the whole of itself, not against the
+	// A run must be measured against the whole of itself, not against the
 	// carrier that opened it, so take the extremes each time.
 	// A run grows its pool to fit its carrier list, so only the span limits a
-	// group, and a wide span can take the whole band in one run.
-	auto fits = [&](const Group& g, uint32_t hz) {
+	// run, and a wide span can take the whole band in one run.
+	auto fits = [&](const Run& g, uint32_t hz) {
 		double lo = std::min<double>(*std::min_element(g.hz.begin(), g.hz.end()), hz);
 		double hi = std::max<double>(*std::max_element(g.hz.begin(), g.hz.end()), hz);
 		return hi - lo <= 2 * good;
 	};
-	// The control carriers first, because only they can open a group. In one
+	// The control carriers first, because only they can open a run. In one
 	// pass a traffic carrier below its own control carrier would be orphaned
 	// before that control carrier had opened anything.
 	for (size_t k : found) {
 		if (chans[k].main_hz != chans[k].hz) continue;
 		bool placed = false;
-		for (Group& g : runs)
+		for (Run& g : runs)
 			if (fits(g, chans[k].hz)) {
 				g.hz.push_back(chans[k].hz);
 				g.controls++;
 				placed = true;
 				break;
 			}
-		if (!placed) runs.push_back(Group{ { chans[k].hz }, 1 });
+		if (!placed) runs.push_back(Run{ { chans[k].hz }, 1 });
 	}
-	// Then the traffic carriers, into whichever group reaches them.
+	// Then the traffic carriers, into whichever run reaches them.
 	for (size_t k : found) {
 		if (chans[k].main_hz == chans[k].hz) continue;
 		bool placed = false;
-		for (Group& g : runs)
+		for (Run& g : runs)
 			if (fits(g, chans[k].hz)) {
 				g.hz.push_back(chans[k].hz);
 				placed = true;
 				break;
 			}
-		// No group reaches it, and it grants nothing itself.
+		// No run reaches it, and it grants nothing itself.
 		if (!placed) orphans.push_back(chans[k].hz);
 	}
 
@@ -703,7 +703,7 @@ int sweep_main(const SweepArgs& a)
 		       rate / 1e6, runs.size());
 
 	// A run line lists the control carriers, because every grant arrives on
-	// one. A free slot of the pool takes each traffic carrier when a grant
+	// one. A free lane of the pool takes each traffic carrier when a grant
 	// first names it. A carrier whose cell the sweep could not read can be a
 	// control carrier, so it is listed too. The traffic carriers still set the
 	// centre and the width of the span, so that their grants land inside it.
@@ -713,7 +713,7 @@ int sweep_main(const SweepArgs& a)
 		return true;
 	};
 	for (size_t i = 0; i < runs.size(); i++) {
-		Group& g = runs[i];
+		Run& g = runs[i];
 		std::sort(g.hz.begin(), g.hz.end());
 		double center = std::round((((double)g.hz.front() + g.hz.back()) / 2) / 10000) * 10000;
 		std::vector<uint32_t> list;
@@ -725,7 +725,7 @@ int sweep_main(const SweepArgs& a)
 		printf("\n  ./tetra-analyze run --center %.0f \\\n", center);
 		// The rate is what the receiver was measured to take, and the carriers
 		// were grouped into spans that wide. A run at any other rate has a
-		// different span, so the group it is handed may no longer fit.
+		// different span, so the run it is handed may no longer fit.
 		printf("      --rate %.0f \\\n", rate);
 		if (a.rx) printf("      --rx %d \\\n", a.rx);
 		if (a.antenna && *a.antenna) printf("      --antenna %s \\\n", a.antenna);
@@ -733,7 +733,7 @@ int sweep_main(const SweepArgs& a)
 		// A receiver with no AGC needs the gain that found these carriers.
 		if (a.gain_db >= 0) printf("      --gain %g \\\n", a.gain_db);
 		if (!ppm.empty()) printf("      --tune-offset %ld \\\n", offset_at(center));
-		// The pool needs a slot for every carrier that the sweep found here.
+		// The pool needs a lane for every carrier that the sweep found here.
 		if (g.hz.size() > DEFAULT_MAX_CARRIERS) printf("      --max-carriers %zu \\\n", g.hz.size());
 		printf("      --carriers ");
 		for (size_t j = 0; j < list.size(); j++) printf("%s%u", j ? "," : "", list[j]);
@@ -750,9 +750,9 @@ int sweep_main(const SweepArgs& a)
 	}
 
 	printf("Each run line lists the control carriers, and any carrier whose cell the\n"
-	       "sweep could not read. \"run\" gives a free slot to each traffic carrier when\n"
+	       "sweep could not read. \"run\" gives a free lane to each traffic carrier when\n"
 	       "a control carrier first grants a call on it. An idle traffic carrier sends\n"
-	       "nothing, so the sweep does not count it. If \"run\" logs NOSLOT, raise\n"
+	       "nothing, so the sweep does not count it. If \"run\" logs NOLANE, raise\n"
 	       "--max-carriers.\n");
 	return 0;
 }
