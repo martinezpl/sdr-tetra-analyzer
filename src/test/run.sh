@@ -32,6 +32,8 @@ run_rec() { "$REC" run "$@" 2>&1 | grep -v -e '^Ranking' -e '^\[Resamp\]' >&2; r
 
 python3 -c "import ast; ast.parse(open('src/ui.py').read())" 2>/dev/null \
 	&& pass "ui.py parses" || fail "ui.py parses"
+python3 src/test/ui_live_test.py >/dev/null 2>&1 \
+	&& pass "ui.py live stream" || fail "ui.py live stream"
 check_ui "$TMP/page.js"
 if command -v node >/dev/null; then
 	node --check "$TMP/page.js" 2>/dev/null && pass "ui.py page javascript parses" \

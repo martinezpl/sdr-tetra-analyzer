@@ -362,6 +362,13 @@ tetra-analyze ui: reading recordings, reachable on every network
   http://127.0.0.1:8080
 ```
 
+**Listen live** plays the speech of the run while the recorder writes it.
+Without a selection it plays all talkgroups. Tick talkgroups in the table to
+limit it to them; the browser keeps the selection. The mark before a GSSI is
+green while that talkgroup speaks. The sound comes about 1 second after the
+recorder writes it. `/live.pcm` is the stream: 16-bit mono samples at 8 kHz
+with no header, and `?tg=GSSI,GSSI` limits it.
+
 It prints every address it answers on. `--bind` narrows that to one, and
 there is no authentication, so that choice is the only access control.
 

@@ -5,6 +5,9 @@ It parses the files that a run writes and serves one page. It never writes to
 the run directory and it never talks to the recorder, so it can be started,
 stopped or edited while a capture is going on.
 
+The page can also play the speech live. The server follows the end of each
+talkgroup WAV and sends what the recorder adds, see send_live.
+
 usage:
   ui.py [--in DIR] [--bind ADDR] [--port N]
 
@@ -27,6 +30,7 @@ import re
 import socket
 import struct
 import time
+from array import array
 from bisect import bisect_right
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -35,6 +39,15 @@ FRAME = 480  # WAV samples for each calls.log line, see stitch.cpp
 HDR = 44  # bytes of WAV header, see recorder.cpp
 RATE = 8000.0  # WAV sample rate
 MISSED = ("OUTSIDE", "BADFREQ", "NOSLOT", "UNTUNED")
+TICK = 0.1  # seconds of sound in each block of the live stream
+BLOCK = int(RATE * TICK)  # samples in one block
+# A voice frame is 60 ms and its write time has jitter. A talkgroup starts to
+# play when this much time passed after its first new sample, so a late frame
+# does not make a gap in the speech. Tune it if the live speech has gaps.
+LIVE_LEAD = 0.3
+# The recorder appends to a WAV while a talkgroup speaks. The page shows a
+# talkgroup as "talking" for this many seconds after the last append.
+TALKING_S = 3
 
 
 def newest_run(out):
@@ -165,6 +178,19 @@ def wav_samples(path):
         return 0
 
 
+def mix(parts):
+    """One block of the live stream from the blocks of the talkgroups that
+    speak at the same time: the sum of the samples, with a limit at 16 bits.
+    A short part gets silence at its end."""
+    if len(parts) == 1 and len(parts[0]) == BLOCK * 2:
+        return parts[0]
+    total = [0] * BLOCK
+    for part in parts:
+        for i, v in enumerate(array("h", part)):
+            total[i] += v
+    return array("h", (max(-32768, min(32767, v)) for v in total)).tobytes()
+
+
 # What each run directory has been read up to, so a refresh parses only what
 # the recorder appended since the last one.
 _STATE = {}
@@ -243,6 +269,8 @@ def scan(out):
         t["carriers"][hz] = t["carriers"].get(hz, 0) + 1
         if issi != "-":
             t["issis"][issi] = t["issis"].get(issi, 0) + 1
+            if issi != "0":
+                t["talker"] = issi
         carriers[hz] = carriers.get(hz, 0) + 1
         if ctl != "-":
             controls[ctl] = controls.get(ctl, 0) + 1
@@ -263,7 +291,12 @@ def scan(out):
             ({"issi": i, "frames": n} for i, n in t["issis"].items()),
             key=lambda x: -x["frames"],
         )[:4]
-        t["has_audio"] = os.path.exists(wav)
+        try:
+            wav_st = os.stat(wav)
+        except OSError:
+            wav_st = None
+        t["has_audio"] = wav_st is not None
+        t["talking"] = bool(wav_st and time.time() - wav_st.st_mtime < TALKING_S)
     talkgroups = {t["gssi"]: t for t in out_tg}
 
     for m in missed:
@@ -333,6 +366,8 @@ def scan(out):
 
     return {
         "run": os.path.basename(run),
+        # The recorder writes one row of clock.log each second while it runs.
+        "active": bool(last and time.time() - epoch(last[0]) < 15),
         "start_utc": meta.get("start_utc"),
         "iq_rate": iq_rate,
         "span": span,
@@ -419,6 +454,8 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         elif self.path.startswith("/audio/"):
             self.send_audio()
+        elif self.path.split("?")[0] == "/live.pcm":
+            self.send_live()
         elif self.path.split("?")[0] in ("/", "/index.html"):
             body = PAGE.encode()
             self.send_response(200)
@@ -428,6 +465,77 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         else:
             self.send_error(404)
+
+    def send_live(self):
+        """The speech of the newest run while the recorder writes it: 16-bit
+        mono samples at 8 kHz, little-endian, with no header and no end.
+        ?tg=1,2 limits the stream to those talkgroups; without it, the stream
+        has all of them. The stream goes at the speed of a clock and sends
+        silence when nobody speaks, so the page can play each block when it
+        comes."""
+        query = self.path.partition("?")[2]
+        want = set()
+        for item in query.split("&"):
+            if item.startswith("tg="):
+                want = {g for g in item[3:].split(",") if g.isdigit()}
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Accel-Buffering", "no")  # nginx must not hold blocks
+        self.end_headers()
+        silence = bytes(BLOCK * 2)
+        run, offs, pend, ready = None, {}, {}, {}
+        # A WAV that is there at the start holds old speech, so the stream
+        # starts at its end. A WAV that comes later is new from its first sample.
+        old = True
+        due, n = time.monotonic(), 0
+        while True:
+            if n % 10 == 0:  # each second: a new run, or a new talkgroup
+                newest = newest_run(self.recordings)
+                if newest != run:
+                    run, offs, pend, ready = newest, {}, {}, {}
+                try:
+                    files = list(os.scandir(os.path.join(run, "calls"))) if run else []
+                except OSError:
+                    files = []
+                for f in files:
+                    gssi = f.name[:-4]
+                    if not re.fullmatch(r"\d+\.wav", f.name) or gssi in offs:
+                        continue
+                    if want and gssi not in want:
+                        continue
+                    try:
+                        offs[gssi] = (f.path, max(HDR, f.stat().st_size) if old else HDR)
+                    except OSError:
+                        pass
+                old = False
+            n += 1
+            now = time.monotonic()
+            parts = []
+            for gssi, (path, off) in offs.items():
+                try:
+                    more = (os.path.getsize(path) - off) & ~1  # whole samples only
+                    if more > 0:
+                        with open(path, "rb") as f:
+                            f.seek(off)
+                            data = f.read(more)
+                        data = data[:len(data) & ~1]
+                        offs[gssi] = (path, off + len(data))
+                        pend[gssi] = pend.get(gssi, b"") + data
+                except OSError:
+                    pass
+                buf = pend.get(gssi)
+                if not buf:
+                    ready.pop(gssi, None)
+                    continue
+                if now < ready.setdefault(gssi, now + LIVE_LEAD):
+                    continue
+                parts.append(buf[:BLOCK * 2])
+                pend[gssi] = buf[BLOCK * 2:]
+            self.wfile.write(mix(parts) if parts else silence)
+            self.wfile.flush()
+            due += TICK
+            time.sleep(max(0.0, due - time.monotonic()))
 
     def send_audio(self):
         """A WAV of one talkgroup, with Range so a browser can seek in it."""
@@ -552,9 +660,58 @@ summary .caret{color:var(--dim);transition:rotate 150ms cubic-bezier(.2,0,0,1)}
 details[open] summary .caret{rotate:90deg}
 summary .count{color:var(--dim);font-variant-numeric:tabular-nums}
 .panel{padding:0 12px 10px;max-height:340px;overflow:auto}
+
+/* The live bar stays at the top of the window, so the button and the name of
+   the talkgroup that speaks are there at each scroll position. */
+.pill{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;
+padding:2px 8px;border-radius:999px;border:1px solid var(--line);color:var(--dim);
+margin-left:8px;vertical-align:1px}
+.pill.on{color:var(--ok);border-color:#2c5a3a}
+.live{position:sticky;top:8px;z-index:5;display:flex;align-items:center;gap:14px;
+flex-wrap:wrap;background:#181c23;border:1px solid var(--line);border-radius:10px;
+padding:10px 12px;margin:0 0 12px;box-shadow:0 8px 18px -10px #000}
+#livebtn{font:inherit;font-weight:600;color:var(--fg);background:#232d3d;
+border:1px solid #39465a;border-radius:8px;height:40px;padding:0 16px;
+display:inline-flex;align-items:center;gap:9px;cursor:pointer;white-space:nowrap;
+transition:background 150ms cubic-bezier(.2,0,0,1),border-color 150ms cubic-bezier(.2,0,0,1),
+scale 100ms cubic-bezier(.2,0,0,1)}
+#livebtn:hover{background:#2a3649}
+#livebtn:active{scale:.97}
+#livebtn[aria-pressed=true]{background:#3a2020;border-color:#7a3a35}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--dim)}
+#livebtn[aria-pressed=true] .dot{background:var(--bad);animation:pulse 1.4s ease-in-out infinite}
+@keyframes pulse{50%{opacity:.35}}
+.meter{width:90px;height:6px;border-radius:3px;background:var(--line);overflow:hidden}
+.meter i{display:block;height:100%;width:0;background:var(--ok)}
+.livetxt{min-width:0;flex:1 1 240px}
+.livetxt div{overflow-wrap:anywhere}
+.dim{color:var(--dim);font-size:12px}
+.link{font:inherit;color:var(--ctl);background:none;border:0;padding:0;cursor:pointer;
+text-decoration:underline}
+/* The mark before a GSSI is green while the recorder adds speech to its WAV. */
+.tk{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:8px;
+background:#2a3240}
+tr.talking .tk{background:var(--ok);animation:pulse 1.4s ease-in-out infinite}
+tr.talking td{background:#16211b}
+/* The label is the target of the checkbox, 28px, so it is easy to hit. */
+.pick{display:inline-flex;width:28px;height:28px;align-items:center;
+justify-content:center;cursor:pointer;margin:-4px 0}
+.pick input{accent-color:var(--ctl);width:15px;height:15px;margin:0;cursor:pointer}
+:focus-visible{outline:2px solid var(--ctl);outline-offset:2px}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style>
-<h1>tetra-analyze</h1>
+<h1>tetra-analyze<span class="pill" id="pill" hidden></span></h1>
 <div class="sub" id="sub">loading&hellip;</div>
+<div class="live">
+  <button id="livebtn" type="button" aria-pressed="false"><span class="dot"></span><span
+    id="livelbl">Listen live</span></button>
+  <div class="meter" aria-hidden="true"><i id="level"></i></div>
+  <div class="livetxt">
+    <div id="livewho" aria-live="polite">Play the speech when it comes in.</div>
+    <div class="dim"><span id="livesel"></span>
+      <button id="liveall" type="button" class="link" hidden>Listen to all</button></div>
+  </div>
+</div>
 <div class="strip" id="strip"></div>
 
 <h2 id="h-band">Band covered</h2>
@@ -713,10 +870,138 @@ function band(d){
     '<span>' + mhz(s.high) + ' MHz</span>';
 }
 
+// ---- Live mode. The server sends 16-bit samples at 8 kHz with no end, and
+// silence when nobody speaks. Each block plays immediately after the one before.
+const $ = id => document.getElementById(id);
+const KEY = "tetra-live-talkgroups";
+// The talkgroups that live mode plays. Empty means all of them.
+let sel = new Set();
+try { sel = new Set(JSON.parse(localStorage.getItem(KEY) || "[]").map(String)); } catch(e){}
+let D = null;                 // the last overview
+let ctx = null, analyser = null, level = null;
+let liveOn = false, conn = null, lost = false, playAt = 0, carry = null, again = 0;
+// Sound that the page holds before it plays. It hides the jitter of the network.
+const LEAD = 0.25;
+
+function play(bytes){
+  if (carry){                 // a block can end in the middle of a sample
+    const joined = new Uint8Array(carry.length + bytes.length);
+    joined.set(carry); joined.set(bytes, carry.length); bytes = joined;
+  }
+  const n = bytes.length >> 1;
+  carry = bytes.length & 1 ? bytes.slice(n*2) : null;
+  if (!n || !ctx) return;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, n*2);
+  const buf = ctx.createBuffer(1, n, 8000), ch = buf.getChannelData(0);
+  for (let i = 0; i < n; i++) ch[i] = view.getInt16(i*2, true) / 32768;
+  const now = ctx.currentTime;
+  if (playAt < now + 0.02) playAt = now + LEAD;   // the start, or the sound ran out
+  if (playAt > now + 3) return;                   // the tab slept: drop the old sound
+  const src = ctx.createBufferSource();
+  src.buffer = buf; src.connect(analyser); src.start(playAt);
+  playAt += n / 8000;
+}
+
+async function connect(){
+  if (conn) conn.abort();
+  const my = conn = new AbortController();
+  carry = null; playAt = 0;
+  try {
+    const r = await fetch("live.pcm?tg=" + [...sel].join(","), {signal: my.signal, cache: "no-store"});
+    if (!r.ok) throw new Error(r.status);
+    lost = false; who();
+    const rd = r.body.getReader();
+    for (;;){
+      const {done, value} = await rd.read();
+      if (done) break;
+      if (conn === my) play(value);
+    }
+  } catch(e){}
+  if (!liveOn || conn !== my) return;             // stopped, or a newer stream took over
+  lost = true; who();
+  setTimeout(() => { if (liveOn && conn === my) connect(); }, 1500);
+}
+
+function meter(){
+  if (!ctx){ $("level").style.width = "0"; return; }
+  analyser.getByteTimeDomainData(level);
+  let peak = 0;
+  for (const v of level) peak = Math.max(peak, Math.abs(v - 128));
+  $("level").style.width = Math.min(100, peak / 128 * 140) + "%";
+  requestAnimationFrame(meter);
+}
+
+// The line next to the button: who speaks now, or why there is no sound.
+function who(){
+  const el = $("livewho");
+  const act = !D || D.active;
+  if (!liveOn){
+    el.textContent = act ? "Play the speech when it comes in."
+      : "No run is active. Live mode plays speech only while a run records.";
+    return;
+  }
+  if (lost){ el.textContent = "The stream stopped. The page tries again."; return; }
+  const now = (D ? D.talkgroups : []).filter(t => t.talking && (!sel.size || sel.has(t.gssi)));
+  el.textContent = now.length
+    ? "Now: " + now.map(t => t.gssi + (t.talker ? " (radio " + t.talker + ")" : "")).join(", ")
+    : act ? "Live. Nobody speaks now." : "Live, but no run is active, so no speech comes in.";
+}
+
+function selection(changed){
+  const list = [...sel].sort((a, b) => a - b);
+  $("livesel").textContent = !list.length
+      ? "Live plays all talkgroups. Tick talkgroups in the table to limit it."
+    : list.length <= 4 ? "Live plays only " + list.join(", ") + "."
+    : "Live plays only " + list.length + " selected talkgroups.";
+  $("liveall").hidden = !list.length;
+  if (!changed) return;
+  try { localStorage.setItem(KEY, JSON.stringify(list)); } catch(e){}
+  who();
+  // One new stream after the last tick, not one for each tick.
+  clearTimeout(again);
+  if (liveOn) again = setTimeout(connect, 400);
+}
+
+$("livebtn").onclick = () => {
+  liveOn = !liveOn; lost = false;
+  $("livebtn").setAttribute("aria-pressed", liveOn);
+  $("livelbl").textContent = liveOn ? "Stop live" : "Listen live";
+  if (liveOn){
+    // The browser permits sound only after a click, so the context starts here.
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
+    analyser = ctx.createAnalyser(); analyser.fftSize = 256;
+    level = new Uint8Array(analyser.fftSize);
+    analyser.connect(ctx.destination);
+    connect(); meter();
+  } else {
+    if (conn) conn.abort();
+    conn = null;
+    // A closed context drops the sound that is in its queue.
+    ctx.close(); ctx = null;
+  }
+  who();
+};
+$("liveall").onclick = () => {
+  sel.clear();
+  for (const box of document.querySelectorAll("#tg input[data-g]")) box.checked = false;
+  selection(true);
+};
+$("tg").addEventListener("change", e => {
+  const g = e.target.dataset.g;
+  if (!g) return;
+  if (e.target.checked) sel.add(g); else sel.delete(g);
+  selection(true);
+});
+selection(false);
+
 async function load(){
-  let d; try { d = await (await fetch("/api/overview")).json(); }
+  let d; try { d = await (await fetch("api/overview")).json(); }
   catch(e){ document.getElementById("sub").textContent = "cannot reach the server"; return; }
   if (d.error){ document.getElementById("sub").textContent = d.error; return; }
+  D = d;
+  const pill = $("pill");
+  pill.hidden = false; pill.textContent = d.active ? "recording" : "stopped";
+  pill.className = "pill" + (d.active ? " on" : "");
   const h = d.health || {};
   document.getElementById("sub").textContent =
     "run " + d.run + "   started " + (d.start_utc||"?") + "   " +
@@ -775,6 +1060,8 @@ async function load(){
     "named that no slot recorded. Hover any region or mark for its own detail.");
   head("h-tg", "Talkgroups",
     "One row for each talkgroup (GSSI) with recorded speech, and its own WAV. "+
+    "The mark before a GSSI is green while that talkgroup speaks. Tick the "+
+    "box of a row to limit live mode to the rows with a tick. "+
     "Carriers lists every carrier it has been heard on, which is more than one "+
     "when the network moves a call. Radios lists the ISSIs that transmitted.");
   head("h-car", "Carriers",
@@ -788,9 +1075,12 @@ async function load(){
     "program was simply not listening there. Each row says why.");
 
   tbl("tg", [
-    {h:"GSSI", f:r=>esc(r.gssi)},
+    {h:"live", once:true, f:r=>'<label class="pick" title="Play this talkgroup in live mode">'
+      + '<input type="checkbox" data-g="'+esc(r.gssi)+'"'+(sel.has(r.gssi)?" checked":"")
+      + ' aria-label="Live mode: talkgroup '+esc(r.gssi)+'"></label>'},
+    {h:"GSSI", once:true, f:r=>'<span class="tk"></span>'+esc(r.gssi)},
     {h:"audio", once:true, f:r=>r.has_audio?
-      '<audio controls preload="none" src="/audio/'+esc(r.gssi)+'.wav"></audio>':"—"},
+      '<audio controls preload="none" src="audio/'+esc(r.gssi)+'.wav"></audio>':"—"},
     {h:"speech", cls:"num", f:r=>dur(r.seconds)},
     {h:"frames", cls:"num", f:r=>r.frames},
     {h:"carriers", f:r=>r.carriers.map(c=>mhz(c.hz)).join(" ")},
@@ -798,6 +1088,9 @@ async function load(){
     {h:"first heard", f:r=>esc(hhmm(r.first_utc))},
     {h:"last heard", f:r=>esc(hhmm(r.last_utc))},
   ], d.talkgroups, "nothing recorded yet", r=>r.gssi);
+  const talking = new Set(d.talkgroups.filter(t=>t.talking).map(t=>t.gssi));
+  for (const tr of $("tg").tBodies[0].rows) tr.classList.toggle("talking", talking.has(tr.dataset.k));
+  who();
 
   const learned = new Set(d.learned), pool = new Set(d.pool), ctl = new Set(d.controls);
   const heard = r => ["carrier","control"].includes(r.role);
@@ -832,7 +1125,7 @@ async function load(){
   ], d.missed.slice().reverse(), "every granted call was recorded",
      r=>r.sample+"/"+r.hz+"/"+r.gssi);
 }
-load(); setInterval(load, 5000);
+load(); setInterval(load, 2000);
 </script>
 """
 
